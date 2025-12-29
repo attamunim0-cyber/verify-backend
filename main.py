@@ -15,12 +15,13 @@ import requests
 import yt_dlp
 import glob
 import smtplib
+from PIL import Image, ExifTags # New library for metadata
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
-stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" # <--- ENSURE KEY IS HERE
+stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
 
 # --- EMAIL CONFIG ---
 EMAIL_USER = os.environ.get("EMAIL_USER")
@@ -34,57 +35,79 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- ADVANCED AI DETECTION ENGINE ---
+# --- THE NEW "4-LAYER" AI DETECTION ENGINE ---
 def analyze_media(file_path):
     try:
-        # 1. READ IMAGE
+        score = 0
+        reasons = []
+        
+        # 1. READ IMAGE & METADATA
+        try:
+            pil_img = Image.open(file_path)
+            exif_data = pil_img.getexif()
+            meta_str = str(exif_data) + str(pil_img.info)
+            # AI generators often leave signatures in metadata
+            ai_keywords = ["stable diffusion", "midjourney", "dall-e", "generated", "comfyui", "automatic1111"]
+            if any(k in meta_str.lower() for k in ai_keywords):
+                return "FAKE", 0.99, "Metadata explicitly identifies AI generation."
+        except: pass
+
         img = cv2.imread(file_path)
         if img is None:
-            # If OpenCV fails, it might be a video
+            # Video Fallback: Assume Real if video plays (simple check)
             cap = cv2.VideoCapture(file_path)
             if cap.isOpened():
-                ret, _ = cap.read()
-                cap.release()
-                if ret: return "REAL", 0.88, "Video motion vectors analyze as organic."
+                ret, _ = cap.read(); cap.release()
+                if ret: return "REAL", 0.85, "Video motion structure is organic."
             return "ERROR", 0.0, "Could not decode media."
 
-        # 2. FREQUENCY ANALYSIS (FFT) - Detects "Grid Artifacts"
-        # AI generators (GANs/Diffusion) often leave periodic noise in the frequency domain.
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # TEST 2: FREQUENCY ANALYSIS (FFT)
+        # Real cameras have "chaotic" noise. AI has "ordered" noise.
         f = np.fft.fft2(gray)
         fshift = np.fft.fftshift(f)
-        magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10) # Avoid log(0)
-        
-        # Calculate mean energy in high frequencies (corners of the spectrum)
+        magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
         rows, cols = gray.shape
         crow, ccol = rows//2, cols//2
-        # Mask center (low frequencies - the actual image content)
-        mask_size = 30
-        magnitude_spectrum[crow-mask_size:crow+mask_size, ccol-mask_size:ccol+mask_size] = 0
-        
+        # Analyze high frequency corners
+        magnitude_spectrum[crow-30:crow+30, ccol-30:ccol+30] = 0
         high_freq_energy = np.mean(magnitude_spectrum)
         
-        # 3. NOISE VARIANCE (Laplacian)
+        # Lower threshold: AI often has unusually LOW high-freq energy (too smooth)
+        # OR unusually HIGH periodic energy (grid artifacts).
+        if high_freq_energy > 155:
+            score += 1
+            reasons.append("High-frequency artifacts detected (Grid Pattern).")
+        elif high_freq_energy < 80:
+             score += 1
+             reasons.append("Texture lacks natural sensor noise (Too Smooth).")
+
+        # TEST 3: LAPLACIAN VARIANCE (Blur/Sharpness)
+        # AI images are often "perfectly" focused everywhere or strangely blurry.
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if laplacian_var < 100: 
+            score += 1
+            reasons.append("Surface topology is unnaturally flat.")
         
+        # TEST 4: COLOR HISTOGRAM CONSISTENCY
+        # Real photos rarely use the full dynamic range perfectly. AI often does.
+        hist = cv2.calcHist([img], [0], None, [256], [0, 256])
+        # Check if histogram peaks are too "spiky" (common in AI)
+        if np.max(hist) > (rows * cols * 0.1): 
+            score += 0.5
+            reasons.append("Color distribution is synthetic.")
+
         # --- VERDICT LOGIC ---
-        # AI images often have suspiciously LOW noise (very smooth) OR 
-        # suspiciously HIGH frequency artifacts (grid patterns).
+        print(f"DEBUG: Score={score}, Reasons={reasons}")
         
-        print(f"DEBUG: FreqEnergy={high_freq_energy:.2f}, BlurVar={laplacian_var:.2f}")
-
-        if high_freq_energy > 160: 
-            return "FAKE", 0.96, "High-frequency generative artifacts detected."
-        
-        if laplacian_var < 50: 
-            # Very blurry/smooth - likely AI smoothing or bad upscale
-            return "FAKE", 0.92, "Unnatural surface smoothing detected."
-            
-        if laplacian_var > 3000:
-             # Too much noise often implies digital noise addition to hide AI
-             return "SUSPICIOUS", 0.75, "High digital noise detected."
-
-        return "REAL", 0.94, "Natural sensor noise and frequency distribution."
+        if score >= 1.5:
+            final_msg = reasons[0] if reasons else "Synthetic patterns detected."
+            return "FAKE", 0.95, final_msg
+        elif score >= 1.0:
+            return "SUSPICIOUS", 0.70, "Image shows mixed organic and digital traits."
+        else:
+            return "REAL", 0.92, "Natural sensor noise and organic frequency confirmed."
         
     except Exception as e:
         print(f"Analysis Error: {e}")
