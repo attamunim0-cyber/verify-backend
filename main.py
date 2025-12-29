@@ -59,12 +59,20 @@ def analyze_media(file_path):
                 if ret: return "REAL", 0.85, "Motion vectors appear organic."
             return "ERROR", 0.0, "Could not decode media."
 
+        # --- CRITICAL FIX: RESIZE IMAGE TO PREVENT SERVER CRASH ---
+        # Free servers crash with 4K/12MP phone photos. We must resize.
+        height, width = img.shape[:2]
+        max_dim = 1500
+        if height > max_dim or width > max_dim:
+            scale = max_dim / max(height, width)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        # ---------------------------------------------------------
+
         # Convert to various color spaces for analysis
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
         # TEST 2: FREQUENCY ANALYSIS (The "Grid" Check)
-        # We look for invisible checkerboard patterns common in Diffusion models.
         f = np.fft.fft2(gray)
         fshift = np.fft.fftshift(f)
         magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
@@ -77,26 +85,22 @@ def analyze_media(file_path):
         
         high_freq_energy = np.mean(magnitude_spectrum)
         
-        # STRICTER THRESHOLDS:
-        # > 135: Strong grid artifacts (Fake)
-        # < 75:  Unnaturally smooth/blurred (Fake)
+        # STRICT THRESHOLDS
         if high_freq_energy > 135: 
-            score += 1.5 # Massive penalty for grid artifacts
+            score += 1.5 
             reasons.append(f"Artificial grid patterns detected (Energy: {int(high_freq_energy)}).")
         elif high_freq_energy < 75:
             score += 1.0
             reasons.append("Texture is unnaturally smooth.")
 
         # TEST 3: COLOR VIBRANCY (Saturation Check)
-        # AI models often over-saturate images compared to real camera sensors.
         saturation = hsv[:,:,1]
         mean_sat = np.mean(saturation)
-        if mean_sat > 110: # Real photos rarely average above ~80-90
+        if mean_sat > 110: 
             score += 0.5
             reasons.append("Color saturation exceeds natural sensor limits.")
 
         # TEST 4: NOISE CONSISTENCY (Laplacian Variance)
-        # Real photos have a specific range of "sharpness". 
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         
         if laplacian_var < 80:
@@ -113,7 +117,6 @@ def analyze_media(file_path):
             final_msg = reasons[0] if reasons else "Synthetic signatures detected."
             return "FAKE", 0.96, final_msg
         elif score >= 0.5:
-            # Even a small issue makes it suspicious now
             return "SUSPICIOUS", 0.75, "Image contains mixed organic/digital traits."
         else:
             return "REAL", 0.92, "Passed frequency, color, and noise stress tests."
