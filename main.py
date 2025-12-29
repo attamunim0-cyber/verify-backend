@@ -8,73 +8,114 @@ import os
 import shutil
 import sqlite3
 import hashlib
+import random
+import string
 
 app = FastAPI()
-DB_NAME = "users.db"
+
+# --- TRICK: NEW DATABASE NAME ---
+# Changing this name forces a fresh start without paying for Shell access!
+DB_NAME = "verify_shield_v2.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)''')
+    # Create the NEW table structure
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (email TEXT PRIMARY KEY, 
+                  name TEXT, 
+                  password TEXT, 
+                  verification_code TEXT,
+                  is_verified INTEGER DEFAULT 0)''')
     conn.commit()
     conn.close()
 
-init_db()
+init_db() # Run immediately on startup
 
-class UserCredentials(BaseModel):
-    username: str
-    password: str = None # Optional for Google Login
-
-class GoogleLoginRequest(BaseModel):
+# --- MODELS ---
+class UserSignup(BaseModel):
+    name: str
     email: str
+    password: str
 
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserVerification(BaseModel):
+    email: str
+    code: str
+
+# --- HELPERS ---
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# --- STANDARD LOGIN ---
-@app.post("/register")
-async def register(user: UserCredentials):
+def generate_code():
+    return ''.join(random.choices(string.digits, k=6))
+
+# --- USER ENDPOINTS ---
+
+@app.post("/signup")
+async def signup(user: UserSignup):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     try:
-        if c.execute("SELECT * FROM users WHERE username=?", (user.username,)).fetchone():
-            return JSONResponse(content={"status": "error", "message": "Username taken"}, status_code=400)
-        c.execute("INSERT INTO users VALUES (?, ?)", (user.username, hash_password(user.password)))
+        # Check if email exists
+        if c.execute("SELECT * FROM users WHERE email=?", (user.email,)).fetchone():
+            return JSONResponse(content={"status": "error", "message": "Email already registered"}, status_code=400)
+        
+        v_code = generate_code()
+        hashed_pass = hash_password(user.password)
+        
+        # Save user as Unverified
+        c.execute("INSERT INTO users (email, name, password, verification_code, is_verified) VALUES (?, ?, ?, ?, 0)", 
+                  (user.email, user.name, hashed_pass, v_code))
         conn.commit()
-        return {"status": "success", "message": "Created!"}
+
+        # --- SIMULATE EMAIL (PRINT TO LOGS) ---
+        print(f"\n[EMAIL SIMULATION] To: {user.email}")
+        print(f"[EMAIL SIMULATION] Code: {v_code}\n")
+        
+        return {"status": "success", "message": "Verification code sent! Check server logs."}
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
     finally:
         conn.close()
 
-@app.post("/login")
-async def login(user: UserCredentials):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    result = c.execute("SELECT * FROM users WHERE username=? AND password=?", (user.username, hash_password(user.password))).fetchone()
-    conn.close()
-    if result: return {"status": "success", "message": "Login successful"}
-    else: return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
-
-# --- NEW: GOOGLE LOGIN ENDPOINT ---
-@app.post("/google_login")
-async def google_login(request: GoogleLoginRequest):
+@app.post("/verify")
+async def verify(data: UserVerification):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     try:
-        # Check if this email exists
-        user = c.execute("SELECT * FROM users WHERE username=?", (request.email,)).fetchone()
+        user = c.execute("SELECT verification_code FROM users WHERE email=?", (data.email,)).fetchone()
+        if not user:
+            return JSONResponse(content={"status": "error", "message": "User not found"}, status_code=404)
         
-        if user:
-            # User exists, log them in
-            return {"status": "success", "message": "Welcome back!"}
-        else:
-            # New user! Create account automatically with a dummy password
-            c.execute("INSERT INTO users VALUES (?, ?)", (request.email, "GOOGLE_AUTH_USER"))
+        if user[0] == data.code:
+            c.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE email=?", (data.email,))
             conn.commit()
-            return {"status": "success", "message": "Account created via Google!"}
+            return {"status": "success", "message": "Account verified!"}
+        else:
+            return JSONResponse(content={"status": "error", "message": "Invalid code"}, status_code=400)
     finally:
         conn.close()
+
+@app.post("/login")
+async def login(user: UserLogin):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    row = c.execute("SELECT name, is_verified FROM users WHERE email=? AND password=?", 
+                    (user.email, hash_password(user.password))).fetchone()
+    conn.close()
+    
+    if row:
+        name, is_verified = row
+        if is_verified:
+            return {"status": "success", "message": f"Welcome, {name}!", "username": name}
+        else:
+            return JSONResponse(content={"status": "error", "message": "Account not verified."}, status_code=401)
+    else:
+        return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
 
 # --- SCANNER LOGIC ---
 def get_variance(image):
@@ -92,7 +133,7 @@ def analyze_frame(frame):
     faces = face_cascade.detectMultiScale(gray, 1.1, 4)
     noise_score = get_variance(frame)
     
-    if noise_score < 300: return True, 0.1, f"Suspiciously smooth (Score: {int(noise_score)}). Likely AI."
+    if noise_score < 200: return True, 0.1, f"Suspiciously smooth (Score: {int(noise_score)}). Likely AI."
     if len(faces) == 0: return True, 0.3, "No human face detected."
     return False, 0.98, f"Natural noise detected (Score: {int(noise_score)})."
 
