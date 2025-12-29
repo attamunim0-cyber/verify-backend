@@ -4,3 +4,4 @@ requests
 boto3
 pydantic
 python-multipart
+opencv-python-headless
