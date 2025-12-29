@@ -16,7 +16,7 @@ app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
 # --- CONFIGURATION ---
-stripe.api_key = "pk_live_51Q2kAoCFpfwvg3Qdh9sHKKzkbxqAF4O3obA1VR6lqWLt3NJJ89mB3EEwTc9VrJOq4bDdCZ9h0jT68SMN7CzDDxJO009uz1sGTW" # <--- PASTE YOUR KEY HERE
+stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" # <--- PASTE YOUR KEY HERE
 PRICE_ID = "price_1Q..." # We will create this automatically or you can set it manually. 
 # For this code, we create a dynamic checkout session for $4.00
 
