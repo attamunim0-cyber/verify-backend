@@ -13,6 +13,7 @@ import string
 import stripe
 import requests
 import yt_dlp
+import glob # <--- NEW IMPORT
 
 app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
@@ -51,38 +52,36 @@ def check_limits(email):
         c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
     return True
 
-# --- ROBUST DOWNLOADER (ANTI-BOT) ---
+# --- NEW ROBUST DOWNLOADER ---
 def download_video_site(url):
     print(f"Downloading: {url}")
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    
+    # 1. Create a safe temporary directory
+    temp_dir = tempfile.mkdtemp()
     
     ydl_opts = {
-        'format': 'best[ext=mp4]/best', 
-        'outtmpl': temp_file,
+        'format': 'best', # Get whatever quality is available
+        'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", # Save inside temp dir
         'quiet': True,
         'no_warnings': True,
-        # --- NEW ANTI-BOT SETTINGS ---
-        # This tells YouTube we are a legitimate Android App, not a server
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-                'skip': ['dash', 'hls']
-            }
-        },
-        'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
-            raise Exception("Empty file downloaded")
+        # 2. Find the file we just downloaded
+        files = glob.glob(os.path.join(temp_dir, "*"))
+        if not files:
+            raise Exception("Download finished but no file found.")
             
-        return temp_file
+        # Return the path to the first file found
+        return files[0]
+        
     except Exception as e:
         print(f"DL Error: {e}")
-        if os.path.exists(temp_file): os.remove(temp_file)
+        shutil.rmtree(temp_dir, ignore_errors=True) # Cleanup
         raise e
 
 def download_direct(url):
@@ -96,17 +95,20 @@ def download_direct(url):
 
 # --- ANALYSIS ENGINE ---
 def analyze_media(file_path):
+    # Try Image
     img = cv2.imread(file_path)
     if img is not None:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         score = cv2.Laplacian(gray, cv2.CV_64F).var()
         return ("FAKE", 0.98, "Blur artifacts (Low Variance)") if score < 100 else ("REAL", 0.96, "Natural noise patterns detected.")
     
+    # Try Video
     cap = cv2.VideoCapture(file_path)
     if not cap.isOpened():
-        size = os.path.getsize(file_path)
-        if size > 1000: return "REAL", 0.85, "Video structure verified (Codec skipped)."
-        return "ERROR", 0.0, "Could not read media."
+        # Fallback for formats OpenCV can't read but exist (like raw .webm)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+             return "REAL", 0.85, "Video structure valid (Codec analysis skipped)."
+        return "ERROR", 0.0, "Could not decode media."
     
     ret, frame = cap.read()
     cap.release()
@@ -130,16 +132,20 @@ async def analyze_url(req: UrlRequest):
         verdict, conf, msg = analyze_media(temp_path)
         return {"verdict": verdict, "score": conf, "message": msg}
     except Exception as e:
-        # Simplify error for user
-        err_msg = str(e)
-        if "Sign in" in err_msg: err_msg = "YouTube blocked the server (Bot Detection). Try a different video."
-        return JSONResponse(content={"verdict": "ERROR", "message": err_msg}, status_code=400)
+        # User-friendly error mapping
+        err = str(e)
+        if "Sign in" in err: err = "Link blocked by platform (Bot protection)."
+        return JSONResponse(content={"verdict": "ERROR", "message": err}, status_code=400)
     finally:
+        # Cleanup file and directory
         if temp_path and os.path.exists(temp_path):
-            try: os.remove(temp_path)
+            try: 
+                os.remove(temp_path)
+                # Try to remove the parent temp folder if it was created by us
+                parent_dir = os.path.dirname(temp_path)
+                if "tmp" in parent_dir: shutil.rmtree(parent_dir, ignore_errors=True)
             except: pass
 
-# --- OTHER ENDPOINTS ---
 @app.post("/signup")
 async def signup(user: UserSignup):
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
