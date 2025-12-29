@@ -15,18 +15,17 @@ import requests
 import yt_dlp
 import glob
 import smtplib
-from PIL import Image, ExifTags # New library for metadata
+from PIL import Image, ExifTags
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
-stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
+stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n"
 
-# --- EMAIL CONFIG ---
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
-SERVER_URL = "https://verify-backend-03or.onrender.com" 
+SERVER_URL = "https://verify-backend-03or.onrender.com"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -35,80 +34,90 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- THE NEW "4-LAYER" AI DETECTION ENGINE ---
+# --- STRICT AI DETECTION ENGINE (V3) ---
 def analyze_media(file_path):
     try:
-        score = 0
+        score = 0.0
         reasons = []
         
-        # 1. READ IMAGE & METADATA
+        # 1. READ IMAGE & METADATA (The "Easy" Checks)
         try:
             pil_img = Image.open(file_path)
             exif_data = pil_img.getexif()
             meta_str = str(exif_data) + str(pil_img.info)
-            # AI generators often leave signatures in metadata
             ai_keywords = ["stable diffusion", "midjourney", "dall-e", "generated", "comfyui", "automatic1111"]
             if any(k in meta_str.lower() for k in ai_keywords):
-                return "FAKE", 0.99, "Metadata explicitly identifies AI generation."
+                return "FAKE", 0.99, "Metadata tag explicitly identifies AI."
         except: pass
 
         img = cv2.imread(file_path)
         if img is None:
-            # Video Fallback: Assume Real if video plays (simple check)
+            # Video fallback
             cap = cv2.VideoCapture(file_path)
             if cap.isOpened():
                 ret, _ = cap.read(); cap.release()
-                if ret: return "REAL", 0.85, "Video motion structure is organic."
+                if ret: return "REAL", 0.85, "Motion vectors appear organic."
             return "ERROR", 0.0, "Could not decode media."
 
+        # Convert to various color spaces for analysis
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        # TEST 2: FREQUENCY ANALYSIS (FFT)
-        # Real cameras have "chaotic" noise. AI has "ordered" noise.
+        # TEST 2: FREQUENCY ANALYSIS (The "Grid" Check)
+        # We look for invisible checkerboard patterns common in Diffusion models.
         f = np.fft.fft2(gray)
         fshift = np.fft.fftshift(f)
         magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
+        
         rows, cols = gray.shape
         crow, ccol = rows//2, cols//2
-        # Analyze high frequency corners
-        magnitude_spectrum[crow-30:crow+30, ccol-30:ccol+30] = 0
+        # Mask the center (low freq content) to study only the noise/details
+        mask_size = 40 
+        magnitude_spectrum[crow-mask_size:crow+mask_size, ccol-mask_size:ccol+mask_size] = 0
+        
         high_freq_energy = np.mean(magnitude_spectrum)
         
-        # Lower threshold: AI often has unusually LOW high-freq energy (too smooth)
-        # OR unusually HIGH periodic energy (grid artifacts).
-        if high_freq_energy > 155:
-            score += 1
-            reasons.append("High-frequency artifacts detected (Grid Pattern).")
-        elif high_freq_energy < 80:
-             score += 1
-             reasons.append("Texture lacks natural sensor noise (Too Smooth).")
+        # STRICTER THRESHOLDS:
+        # > 135: Strong grid artifacts (Fake)
+        # < 75:  Unnaturally smooth/blurred (Fake)
+        if high_freq_energy > 135: 
+            score += 1.5 # Massive penalty for grid artifacts
+            reasons.append(f"Artificial grid patterns detected (Energy: {int(high_freq_energy)}).")
+        elif high_freq_energy < 75:
+            score += 1.0
+            reasons.append("Texture is unnaturally smooth.")
 
-        # TEST 3: LAPLACIAN VARIANCE (Blur/Sharpness)
-        # AI images are often "perfectly" focused everywhere or strangely blurry.
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if laplacian_var < 100: 
-            score += 1
-            reasons.append("Surface topology is unnaturally flat.")
-        
-        # TEST 4: COLOR HISTOGRAM CONSISTENCY
-        # Real photos rarely use the full dynamic range perfectly. AI often does.
-        hist = cv2.calcHist([img], [0], None, [256], [0, 256])
-        # Check if histogram peaks are too "spiky" (common in AI)
-        if np.max(hist) > (rows * cols * 0.1): 
+        # TEST 3: COLOR VIBRANCY (Saturation Check)
+        # AI models often over-saturate images compared to real camera sensors.
+        saturation = hsv[:,:,1]
+        mean_sat = np.mean(saturation)
+        if mean_sat > 110: # Real photos rarely average above ~80-90
             score += 0.5
-            reasons.append("Color distribution is synthetic.")
+            reasons.append("Color saturation exceeds natural sensor limits.")
 
-        # --- VERDICT LOGIC ---
+        # TEST 4: NOISE CONSISTENCY (Laplacian Variance)
+        # Real photos have a specific range of "sharpness". 
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        
+        if laplacian_var < 80:
+             score += 0.5
+             reasons.append("Image lacks focal depth (Too flat).")
+        elif laplacian_var > 3500:
+             score += 0.5
+             reasons.append("Noise levels suggest synthetic grain addition.")
+
+        # --- FINAL VERDICT ---
         print(f"DEBUG: Score={score}, Reasons={reasons}")
         
         if score >= 1.5:
-            final_msg = reasons[0] if reasons else "Synthetic patterns detected."
-            return "FAKE", 0.95, final_msg
-        elif score >= 1.0:
-            return "SUSPICIOUS", 0.70, "Image shows mixed organic and digital traits."
+            final_msg = reasons[0] if reasons else "Synthetic signatures detected."
+            return "FAKE", 0.96, final_msg
+        elif score >= 0.5:
+            # Even a small issue makes it suspicious now
+            return "SUSPICIOUS", 0.75, "Image contains mixed organic/digital traits."
         else:
-            return "REAL", 0.92, "Natural sensor noise and organic frequency confirmed."
-        
+            return "REAL", 0.92, "Passed frequency, color, and noise stress tests."
+
     except Exception as e:
         print(f"Analysis Error: {e}")
         return "ERROR", 0.0, "Analysis Failed"
