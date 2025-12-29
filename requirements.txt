@@ -6,6 +6,5 @@ pydantic
 python-multipart
 opencv-python-headless
 stripe
-requests
 yt-dlp
 Pillow
