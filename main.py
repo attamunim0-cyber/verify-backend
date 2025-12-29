@@ -8,62 +8,70 @@ import shutil
 
 app = FastAPI()
 
-# --- 1. THE BRAIN: Deepfake Detection Logic ---
+def analyze_face_texture(face_img):
+    """
+    Checks if the face skin is 'too smooth' (AI) or has 'natural noise' (Real).
+    Returns: is_fake (bool), texture_score (float)
+    """
+    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate the variance of the Laplacian (Measure of focus/texture)
+    # Real skin/video has noise/grain (Variance > 150 usually)
+    # AI/Deepfake skin is often blurry/smooth (Variance < 100)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    
+    # If variance is LOW, it's smooth (Suspicious/AI)
+    # If variance is HIGH, it's textured (Real Camera)
+    is_fake = variance < 100
+    return is_fake, variance
+
 def analyze_frame(frame):
     """
-    Analyzes a single frame for faces.
-    Returns: has_face (bool), score (0.0 to 1.0)
+    Detects face AND analyzes its texture.
     """
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, 1.1, 4)
 
     if len(faces) == 0:
-        return False, 0.0
+        return False, 0.0, None # No face found
     
-    # Found a face -> Assume Real for now (98% confidence)
-    return True, 0.98
+    # Get the largest face
+    (x, y, w, h) = faces[0]
+    face_roi = frame[y:y+h, x:x+w] # Crop the face
+    
+    # Run the Texture Check on the face
+    is_fake, texture_score = analyze_face_texture(face_roi)
+    
+    if is_fake:
+        # Found a face, but it's too smooth!
+        return True, 0.15, "Face detected, but skin is unnaturally smooth (AI Signature)."
+    else:
+        # Found a face, and it has natural grain.
+        return True, 0.98, "Face detected with natural camera noise."
 
-# --- 2. THE NEW SKILL: "Completely AI" Detection ---
-def check_for_synthetic_artifacts(image):
-    """
-    Checks for 'unnatural smoothness' common in AI generation.
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    # Laplace Variance measures "Texture/Noise".
-    # Real photos have High Noise (> 100). AI often has Low Noise (< 100).
-    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-    
-    is_suspicious = variance < 100 
-    return is_suspicious, variance
-
-# --- 3. THE ROUTER: Handles Both Images & Videos ---
+# --- ROUTER ---
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     print(f"Received file: {file.filename}")
     
-    # Save file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp:
         shutil.copyfileobj(file.file, temp)
         temp_path = temp.name
 
     try:
-        # Try to read as Image first
         image_frame = cv2.imread(temp_path)
         frames_to_analyze = []
 
         if image_frame is not None:
-            # It IS an image
             frames_to_analyze = [image_frame]
         else:
-            # It IS a video
             cap = cv2.VideoCapture(temp_path)
             if not cap.isOpened():
                 return JSONResponse(content={"verdict": "ERROR", "score": 0.0, "message": "Could not open media"})
             
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # Analyze 3 frames to be sure
             for i in [0, total_frames // 2, total_frames - 5]:
                 if i < 0: continue
                 cap.set(cv2.CAP_PROP_POS_FRAMES, i)
@@ -73,33 +81,33 @@ async def analyze(file: UploadFile = File(...)):
             cap.release()
 
         # --- ANALYSIS PHASE ---
-        face_found_count = 0
-        total_score = 0.0
+        fake_votes = 0
+        real_votes = 0
+        message = ""
         
         for frame in frames_to_analyze:
-            has_face, score = analyze_frame(frame)
+            has_face, score, msg = analyze_frame(frame)
             if has_face:
-                face_found_count += 1
-                total_score += score
-
-        if face_found_count > 0:
-            # Scenario A: Human Face Found
-            avg_score = total_score / face_found_count
-            verdict = "REAL" if avg_score > 0.5 else "FAKE"
-            return {"verdict": verdict, "score": avg_score}
-        
-        else:
-            # Scenario B: No Face (Check for AI Artifacts)
-            if len(frames_to_analyze) > 0:
-                is_synthetic, noise_level = check_for_synthetic_artifacts(frames_to_analyze[0])
-                print(f"No face. Noise Variance: {noise_level}")
-                
-                if is_synthetic:
-                    return {"verdict": "FAKE", "score": 0.01, "message": "No face, unnatural smoothness detected."}
+                if score < 0.5: # Low score means Fake
+                    fake_votes += 1
+                    message = msg
                 else:
-                    return {"verdict": "UNKNOWN", "score": 0.0, "message": "No human detected."}
-            
-            return {"verdict": "UNKNOWN", "score": 0.0}
+                    real_votes += 1
+            else:
+                # If no face, run general artifact check
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+                if variance < 100:
+                    fake_votes += 1
+                    message = "No face, image too smooth."
+
+        # --- FINAL VERDICT ---
+        if fake_votes > real_votes:
+            return {"verdict": "FAKE", "score": 0.10, "message": message}
+        elif real_votes > 0:
+            return {"verdict": "REAL", "score": 0.98, "message": "Natural face detected."}
+        else:
+            return {"verdict": "UNKNOWN", "score": 0.0, "message": "No clear subject found."}
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
