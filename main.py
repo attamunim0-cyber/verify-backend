@@ -1,5 +1,4 @@
 from fastapi import FastAPI, File, UploadFile, Form, Request, Header
-# --- FIX: ADDED HTMLResponse HERE ---
 from fastapi.responses import JSONResponse, HTMLResponse 
 from pydantic import BaseModel
 import cv2
@@ -36,7 +35,49 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- V7: TITANIUM GRADE DETECTION ENGINE ---
+# --- V8: AUTO-HEAL USER LOGIC ---
+def get_or_create_user(email):
+    """If DB was wiped by Render, re-create the user automatically."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    
+    if not row:
+        # AUTO-HEAL: Create a fresh user so they aren't blocked
+        print(f"DEBUG: Auto-Creating user {email}")
+        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "hash",))
+        conn.commit()
+        row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    
+    conn.close()
+    return row
+
+def check_limits(email):
+    # This now gets OR creates the user, so it never returns False for missing users
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row # Allow column access
+    c = conn.cursor()
+    
+    # 1. Ensure user exists
+    c.execute("INSERT OR IGNORE INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "temp"))
+    conn.commit()
+    
+    # 2. Check limits
+    row = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
+    conn.close()
+    
+    if row['is_premium'] == 1: return True
+    if row['scan_count'] >= 3: return False
+    
+    # Increment scan count
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- DETECTION ENGINE ---
 def perform_ela(img_path):
     try:
         original = Image.open(img_path).convert('RGB')
@@ -50,8 +91,7 @@ def perform_ela(img_path):
             ela_img = ImageEnhance.Brightness(ela_img).enhance(scale)
             stat = np.array(ela_img.convert('L'))
             return np.mean(stat), np.var(stat)
-    except:
-        return 0, 0
+    except: return 0, 0
 
 def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
     score = 0.0
@@ -60,7 +100,6 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     
-    # Frequency Check
     f = np.fft.fft2(gray)
     fshift = np.fft.fftshift(f)
     magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
@@ -69,13 +108,11 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
     magnitude_spectrum[crow-20:crow+20, ccol-20:ccol+20] = 0
     freq_energy = np.mean(magnitude_spectrum)
 
-    # ELA Check
     ela_mean, ela_var = ela_score
     if ela_var < 50: 
         score += 1.5
         reasons.append("Compression signature is artificially uniform (ELA).")
 
-    # Frequency Thresholds
     if freq_energy > 160:
         score += 1.0
         reasons.append(f"Synthetic generation artifacts detected ({int(freq_energy)}).")
@@ -83,7 +120,6 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
         score += 0.5
         reasons.append("Texture lacks natural sensor noise.")
 
-    # Lighting Check
     sat_channel = hsv[:,:,1]
     val_channel = hsv[:,:,2]
     if np.mean(sat_channel) > 130 and np.std(val_channel) > 70:
@@ -94,7 +130,6 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
 
 def analyze_media(file_path):
     try:
-        # Metadata Check
         try:
             pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
@@ -103,24 +138,18 @@ def analyze_media(file_path):
                 return "FAKE", 0.99, "Metadata tag explicitly identifies AI."
         except: pass
 
-        # ELA Calculation
         ela_data = perform_ela(file_path)
-
-        # Image Logic
         img = cv2.imread(file_path)
         if img is not None:
             h, w = img.shape[:2]
             if h > 1024 or w > 1024:
                 s = 1024 / max(h, w)
                 img = cv2.resize(img, None, fx=s, fy=s)
-
             score, reasons = analyze_pixels_v7(img, ela_data, "Image")
-            
             if score >= 1.5: return "FAKE", 0.98, reasons[0]
             elif score >= 1.0: return "SUSPICIOUS", 0.75, "High probability of AI manipulation."
             else: return "REAL", 0.94, "Organic sensor pattern confirmed."
 
-        # Video Logic
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened(): return "ERROR", 0.0, "Read Error"
         
@@ -130,7 +159,6 @@ def analyze_media(file_path):
 
         scores = []
         fake_frames = 0
-        
         for i in range(frames_to_check):
             cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(0, total_frames-1))
             ret, frame = cap.read()
@@ -139,11 +167,9 @@ def analyze_media(file_path):
                 if h > 800:
                     s = 800 / max(h, w)
                     frame = cv2.resize(frame, None, fx=s, fy=s)
-                
                 s_score, _ = analyze_pixels_v7(frame, (0,0), "Video")
                 scores.append(s_score)
                 if s_score >= 1.5: fake_frames += 1
-
         cap.release()
 
         if fake_frames >= 2: return "FAKE", 0.96, "Inconsistent temporal artifacts (AI Video)."
@@ -164,25 +190,24 @@ class ForgotPasswordRequest(BaseModel): email: str
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
-def check_limits(email):
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    u = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
-    conn.close()
-    if not u: return False
-    if u[1] == 1: return True
-    if u[0] >= 3: return False
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
-    return True
-
 @app.post("/user-profile")
 async def get_user_profile(req: UserRequest):
-    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    # AUTO-HEAL: Create user if missing
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # Try to find user
     row = c.execute("SELECT name, email, is_premium, scan_count FROM users WHERE email=?", (req.email,)).fetchone()
+    
+    if not row:
+        # User missing (DB wipe)? Create them now!
+        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (req.email, "User", "restored"))
+        conn.commit()
+        row = c.execute("SELECT name, email, is_premium, scan_count FROM users WHERE email=?", (req.email,)).fetchone()
+    
     conn.close()
-    if row:
-        return {"status": "success", "name": row[0], "email": row[1], "is_premium": bool(row[2]), "scan_count": row[3], "plan_name": "Premium Plan" if row[2] else "Starter Plan"}
-    return JSONResponse(content={"status": "error"}, status_code=404)
+    return {"status": "success", "name": row['name'], "email": row['email'], "is_premium": bool(row['is_premium']), "scan_count": row['scan_count'], "plan_name": "Premium Plan" if row['is_premium'] else "Starter Plan"}
 
 @app.post("/analyze-url")
 async def analyze_url(req: UrlRequest):
@@ -241,7 +266,6 @@ async def login(user: UserLogin):
     if row: return {"status": "success", "username": row[0], "scan_count": row[2], "is_premium": bool(row[3])}
     return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
 
-# --- DEEP LINK PAYMENT REDIRECT ---
 @app.post("/create-checkout-session")
 async def create_checkout_session(req: PaymentRequest):
     try:
@@ -269,6 +293,9 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         user_email = session.get('client_reference_id') or session.get('customer_email')
         if user_email:
             conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+            # AUTO-HEAL: If user is missing from DB (wipe), create them first
+            c.execute("INSERT OR IGNORE INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (user_email, "PaidUser", "hash"))
+            # Then upgrade them
             c.execute("UPDATE users SET is_premium=1 WHERE email=?", (user_email,))
             conn.commit(); conn.close()
     return {"status": "success"}
