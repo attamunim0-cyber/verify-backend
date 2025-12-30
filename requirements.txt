@@ -7,3 +7,5 @@ numpy
 stripe
 yt-dlp
 Pillow
+torch --index-url https://download.pytorch.org/whl/cpu
+transformers
