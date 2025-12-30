@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Form, Request, Header
+from fastapi import FastAPI, File, UploadFile, Form, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import cv2
@@ -23,9 +23,7 @@ app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
 # --- CONFIGURATION ---
-# REPLACE THIS WITH YOUR STRIPE SECRET KEY
-stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
-# REPLACE THIS WITH YOUR STRIPE WEBHOOK SECRET
+stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n"
 STRIPE_ENDPOINT_SECRET = "whsec_HmhvhPDOimozUwdmH135qmtv6DleLWN7"
 
 EMAIL_USER = os.environ.get("EMAIL_USER")
@@ -39,14 +37,14 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- CORE PIXEL ANALYSIS (Used for both Images and Video Frames) ---
+# --- V6: MULTI-FRAME VIDEO ANALYSIS & TUNED THRESHOLDS ---
 def analyze_pixels(img_bgr, source_type="Image"):
     score = 0.0
     reasons = []
 
-    # 1. MEMORY SAVER (Resize)
+    # 1. RESIZE (Standardize input)
     height, width = img_bgr.shape[:2]
-    max_dim = 1200 
+    max_dim = 1000 # Smaller size reduces compression noise false positives
     if height > max_dim or width > max_dim:
         scale = max_dim / max(height, width)
         img_bgr = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -54,111 +52,107 @@ def analyze_pixels(img_bgr, source_type="Image"):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    # 2. FREQUENCY ANALYSIS (Grid Check)
+    # 2. FREQUENCY (Grid Check)
     f = np.fft.fft2(gray)
     fshift = np.fft.fftshift(f)
     magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
     
     rows, cols = gray.shape
     crow, ccol = rows//2, cols//2
-    mask_size = 40 
-    magnitude_spectrum[crow-mask_size:crow+mask_size, ccol-mask_size:ccol+mask_size] = 0
+    magnitude_spectrum[crow-30:crow+30, ccol-30:ccol+30] = 0
     high_freq_energy = np.mean(magnitude_spectrum)
     
-    # Thresholds
-    if high_freq_energy > 165: 
+    # TUNING: Real videos have compression blocks that look like grids.
+    # We RAISE the threshold for "Fake" to avoid catching real videos.
+    grid_threshold = 175 if source_type == "Video Frame" else 165
+    
+    if high_freq_energy > grid_threshold: 
         score += 1.0 
-        reasons.append(f"Suspicious grid artifacts detected (Energy: {int(high_freq_energy)}).")
-    elif high_freq_energy < 50: 
+        reasons.append(f"High-frequency grid artifacts ({int(high_freq_energy)}).")
+    elif high_freq_energy < 40: # Lowered to avoid flagging dark real photos
         score += 0.5 
-        reasons.append(f"{source_type} texture is unusually smooth.")
+        reasons.append("Texture is unnaturally smooth.")
 
-    # 3. SATURATION (Vibrancy)
+    # 3. SATURATION
     saturation = hsv[:,:,1]
     mean_sat = np.mean(saturation)
-    if mean_sat > 135: 
+    if mean_sat > 140: # Relaxed for modern HDR cameras
         score += 0.5
-        reasons.append("Color saturation is abnormally high.")
+        reasons.append("Saturation levels are synthetic.")
 
-    # 4. LAPLACIAN (Sharpness/Noise)
+    # 4. LAPLACIAN (Blur/Noise)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    if laplacian_var < 50:
+    if laplacian_var < 30: # Relaxed for low-light videos
             score += 0.5
-            reasons.append("Lacks focal depth (Too flat).")
-    elif laplacian_var > 4500: 
+            reasons.append("Lacks optical depth (Flat).")
+    elif laplacian_var > 5000: 
             score += 0.5
-            reasons.append("Noise levels suggest synthetic grain.")
+            reasons.append("Noise pattern is synthetic.")
 
     return score, reasons
 
-# --- MEDIA HANDLER ---
 def analyze_media(file_path):
     try:
-        # A. METADATA CHECK
+        # A. METADATA (Fast Fail)
         try:
             pil_img = Image.open(file_path)
-            exif_data = pil_img.getexif()
-            meta_str = str(exif_data) + str(pil_img.info)
-            ai_keywords = ["stable diffusion", "midjourney", "dall-e", "generated", "comfyui", "automatic1111"]
-            if any(k in meta_str.lower() for k in ai_keywords):
-                return "FAKE", 0.99, "Metadata tag explicitly identifies AI."
+            meta = str(pil_img.getexif()) + str(pil_img.info)
+            if any(k in meta.lower() for k in ["midjourney", "diffusion", "generated"]):
+                return "FAKE", 0.99, "Metadata identifies AI."
         except: pass
 
-        # B. TRY AS IMAGE
+        # B. IMAGE HANDLING
         img = cv2.imread(file_path)
         if img is not None:
-            # It is an image
             score, reasons = analyze_pixels(img, "Image")
-            # Verdict Logic
             if score >= 2.0: return "FAKE", 0.96, reasons[0]
-            elif score >= 1.0: return "SUSPICIOUS", 0.65, "Image shows mixed signals."
-            else: return "REAL", 0.94, "Analysis indicates organic origin."
+            elif score >= 1.0: return "SUSPICIOUS", 0.65, "Mixed organic/digital signals."
+            else: return "REAL", 0.94, "Consistent organic texture."
 
-        # C. TRY AS VIDEO
+        # C. VIDEO HANDLING (Multi-Frame)
         cap = cv2.VideoCapture(file_path)
-        if cap.isOpened():
-            # Grab a frame from the middle of the video
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if frame_count > 10:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
-            
-            ret, frame = cap.read()
-            cap.release()
-            
-            if ret:
-                # Analyze the VIDEO FRAME as if it were an image
-                score, reasons = analyze_pixels(frame, "Video Frame")
-                
-                # Video needs slightly stricter logic because compression hides artifacts
-                if score >= 1.5: return "FAKE", 0.95, "Video frames contain synthetic artifacts."
-                elif score >= 1.0: return "SUSPICIOUS", 0.70, "Video texture is inconsistent."
-                else: return "REAL", 0.90, "Video motion and texture appear organic."
+        if not cap.isOpened(): return "ERROR", 0.0, "Could not open media."
 
-        return "ERROR", 0.0, "Could not decode media file."
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames < 3: 
+             # Too short? Treat as Real or Error
+             return "REAL", 0.80, "Video too short for analysis."
+
+        # Analyze 3 frames: Start (10%), Middle (50%), End (90%)
+        points = [total_frames * 0.1, total_frames * 0.5, total_frames * 0.9]
+        frame_scores = []
+        
+        for p in points:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(p))
+            ret, frame = cap.read()
+            if ret:
+                s, _ = analyze_pixels(frame, "Video Frame")
+                frame_scores.append(s)
+        cap.release()
+
+        if not frame_scores: return "ERROR", 0.0, "Could not read frames."
+
+        # VERDICT LOGIC
+        avg_score = sum(frame_scores) / len(frame_scores)
+        
+        # Real videos are messy. AI videos are consistent.
+        # If ANY frame looks extremely fake (score > 2), flag it.
+        if max(frame_scores) >= 2.5:
+             return "FAKE", 0.95, "Synthetic artifacts found in keyframes."
+        elif avg_score >= 1.5:
+             return "FAKE", 0.90, "Consistently artificial texture."
+        elif avg_score >= 0.8:
+             # Relaxed: Real videos often land here due to compression
+             return "SUSPICIOUS", 0.60, "Compression or editing detected."
+        else:
+             return "REAL", 0.92, "Organic motion and texture."
 
     except Exception as e:
-        print(f"Analysis Error: {e}")
+        print(f"Error: {e}")
         return "ERROR", 0.0, "Analysis Failed"
 
-# --- DOWNLOADERS ---
-def download_video_site(url):
-    print(f"Downloading: {url}")
-    temp_dir = tempfile.mkdtemp()
-    ydl_opts = {'format': 'best', 'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 'quiet': True, 'no_warnings': True, 'user_agent': 'Mozilla/5.0'}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
-        files = glob.glob(os.path.join(temp_dir, "*")); 
-        if not files: raise Exception("No file found.")
-        return files[0]
-    except Exception as e: shutil.rmtree(temp_dir, ignore_errors=True); raise e
-
-def download_direct(url):
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    r = requests.get(url, timeout=15, headers=headers); r.raise_for_status()
-    s = ".jpg" if "jpg" in url or "png" in url else ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=s) as t: t.write(r.content); return t.name
-
 # --- ENDPOINTS ---
+class UserRequest(BaseModel): email: str # For Profile Fetch
 class UrlRequest(BaseModel): url: str; email: str
 class UserSignup(BaseModel): name: str; email: str; password: str
 class UserLogin(BaseModel): email: str; password: str
@@ -172,12 +166,28 @@ def check_limits(email):
     u = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
     conn.close()
     if not u: return False
-    if u[1] == 1: return True # Premium = Unlimited
+    if u[1] == 1: return True
     if u[0] >= 3: return False
-    
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
     return True
+
+# --- NEW: PROFILE ENDPOINT ---
+@app.post("/user-profile")
+async def get_user_profile(req: UserRequest):
+    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    row = c.execute("SELECT name, email, is_premium, scan_count FROM users WHERE email=?", (req.email,)).fetchone()
+    conn.close()
+    if row:
+        return {
+            "status": "success",
+            "name": row[0],
+            "email": row[1],
+            "is_premium": bool(row[2]),
+            "scan_count": row[3],
+            "plan_name": "Premium Plan" if row[2] else "Free Starter Plan"
+        }
+    return JSONResponse(content={"status": "error", "message": "User not found"}, status_code=404)
 
 @app.post("/analyze-url")
 async def analyze_url(req: UrlRequest):
@@ -190,8 +200,7 @@ async def analyze_url(req: UrlRequest):
         v, c, m = analyze_media(temp_path)
         return {"verdict": v, "score": c, "message": m}
     except Exception as e: 
-        err = str(e)
-        return JSONResponse(content={"verdict": "ERROR", "message": err}, status_code=400)
+        return JSONResponse(content={"verdict": "ERROR", "message": str(e)}, status_code=400)
     finally:
         if temp_path and os.path.exists(temp_path):
              try: os.remove(temp_path); shutil.rmtree(os.path.dirname(temp_path), ignore_errors=True)
@@ -228,7 +237,6 @@ async def login(user: UserLogin):
     if row: return {"status": "success", "username": row[0], "scan_count": row[2], "is_premium": bool(row[3])}
     return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
 
-# --- STRIPE PAYMENT ---
 @app.post("/create-checkout-session")
 async def create_checkout_session(req: PaymentRequest):
     try:
@@ -237,10 +245,7 @@ async def create_checkout_session(req: PaymentRequest):
             customer_email=req.email,
             client_reference_id=req.email,
             line_items=[{'price_data': {'currency': 'usd', 'product_data': {'name': 'Verify Premium'}, 'unit_amount': 400, 'recurring': {'interval': 'month'}}, 'quantity': 1}],
-            mode='subscription', 
-            success_url='https://google.com', 
-            cancel_url='https://google.com'
-        )
+            mode='subscription', success_url='https://google.com', cancel_url='https://google.com')
         return {"status": "success", "url": cs.url}
     except Exception as e: return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
 
@@ -249,21 +254,15 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
     payload = await request.body()
     try:
         event = stripe.Webhook.construct_event(payload, stripe_signature, STRIPE_ENDPOINT_SECRET)
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=400)
+    except Exception as e: return JSONResponse(content={"error": str(e)}, status_code=400)
 
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         user_email = session.get('client_reference_id') or session.get('customer_email')
-        
         if user_email:
-            print(f"UPGRADING USER: {user_email}")
-            conn = sqlite3.connect(DB_NAME)
-            c = conn.cursor()
+            conn = sqlite3.connect(DB_NAME); c = conn.cursor()
             c.execute("UPDATE users SET is_premium=1 WHERE email=?", (user_email,))
-            conn.commit()
-            conn.close()
-            
+            conn.commit(); conn.close()
     return {"status": "success"}
 
 @app.post("/forgot-password")
@@ -288,3 +287,21 @@ async def reset_action(token: str = Form(...), new_password: str = Form(...)):
     c.execute("UPDATE users SET password=?, reset_token=NULL WHERE reset_token=?", (hash_password(new_password), token))
     conn.commit(); conn.close()
     return "<html><body style='background:#111;color:#0f0;text-align:center;padding:50px'><h1>Success</h1></body></html>"
+
+# --- DOWNLOADERS ---
+def download_video_site(url):
+    print(f"Downloading: {url}")
+    temp_dir = tempfile.mkdtemp()
+    ydl_opts = {'format': 'best', 'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 'quiet': True, 'no_warnings': True, 'user_agent': 'Mozilla/5.0'}
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
+        files = glob.glob(os.path.join(temp_dir, "*")); 
+        if not files: raise Exception("No file found.")
+        return files[0]
+    except Exception as e: shutil.rmtree(temp_dir, ignore_errors=True); raise e
+
+def download_direct(url):
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    r = requests.get(url, timeout=15, headers=headers); r.raise_for_status()
+    s = ".jpg" if "jpg" in url or "png" in url else ".mp4"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=s) as t: t.write(r.content); return t.name
