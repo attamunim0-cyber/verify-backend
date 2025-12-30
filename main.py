@@ -12,6 +12,20 @@ import random
 import string
 import stripe
 import requests
+from fastapi import FastAPI, File, UploadFile, Form, Request, Header
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel
+import cv2
+import numpy as np
+import tempfile
+import os
+import shutil
+import sqlite3
+import hashlib
+import random
+import string
+import stripe
+import requests
 import yt_dlp
 import glob
 import smtplib
@@ -22,11 +36,11 @@ from email.mime.multipart import MIMEMultipart
 app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
-# --- CONFIGURATION ---
-# 1. GET THIS FROM STRIPE DASHBOARD -> DEVELOPERS -> API KEYS
+# --- CONFIGURATION (FILL THESE IN!) ---
+# 1. Stripe Secret Key (sk_test_...)
 stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
 
-# 2. GET THIS FROM STRIPE DASHBOARD -> DEVELOPERS -> WEBHOOKS -> SIGNING SECRET
+# 2. Stripe Webhook Secret (whsec_...)
 STRIPE_ENDPOINT_SECRET = "whsec_HmhvhPDOimozUwdmH135qmtv6DleLWN7"
 
 EMAIL_USER = os.environ.get("EMAIL_USER")
@@ -45,9 +59,9 @@ def analyze_pixels(img_bgr, source_type="Image"):
     score = 0.0
     reasons = []
 
-    # 1. RESIZE (Standardize input to prevent Server Crashes)
+    # 1. RESIZE (Prevent Server Crash)
     height, width = img_bgr.shape[:2]
-    max_dim = 1000 # Smaller size reduces compression noise false positives
+    max_dim = 1000 
     if height > max_dim or width > max_dim:
         scale = max_dim / max(height, width)
         img_bgr = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -65,27 +79,26 @@ def analyze_pixels(img_bgr, source_type="Image"):
     magnitude_spectrum[crow-30:crow+30, ccol-30:ccol+30] = 0
     high_freq_energy = np.mean(magnitude_spectrum)
     
-    # TUNING: Real videos have compression blocks that look like grids.
-    # We RAISE the threshold for "Fake" to avoid catching real videos.
+    # Tuning: Real videos > 175, Real Images > 165
     grid_threshold = 175 if source_type == "Video Frame" else 165
     
     if high_freq_energy > grid_threshold: 
         score += 1.0 
         reasons.append(f"High-frequency grid artifacts ({int(high_freq_energy)}).")
-    elif high_freq_energy < 40: # Lowered to avoid flagging dark real photos
+    elif high_freq_energy < 40: 
         score += 0.5 
         reasons.append("Texture is unnaturally smooth.")
 
     # 3. SATURATION
     saturation = hsv[:,:,1]
     mean_sat = np.mean(saturation)
-    if mean_sat > 140: # Relaxed for modern HDR cameras
+    if mean_sat > 140: 
         score += 0.5
         reasons.append("Saturation levels are synthetic.")
 
     # 4. LAPLACIAN (Blur/Noise)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    if laplacian_var < 30: # Relaxed for low-light videos
+    if laplacian_var < 30: 
             score += 0.5
             reasons.append("Lacks optical depth (Flat).")
     elif laplacian_var > 5000: 
@@ -96,7 +109,7 @@ def analyze_pixels(img_bgr, source_type="Image"):
 
 def analyze_media(file_path):
     try:
-        # A. METADATA (Fast Fail)
+        # A. METADATA
         try:
             pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
@@ -118,10 +131,9 @@ def analyze_media(file_path):
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames < 3: 
-             # Too short? Treat as Real or Error
              return "REAL", 0.80, "Video too short for analysis."
 
-        # Analyze 3 frames: Start (10%), Middle (50%), End (90%)
+        # Analyze 3 frames (Start, Middle, End)
         points = [total_frames * 0.1, total_frames * 0.5, total_frames * 0.9]
         frame_scores = []
         
@@ -138,14 +150,11 @@ def analyze_media(file_path):
         # VERDICT LOGIC
         avg_score = sum(frame_scores) / len(frame_scores)
         
-        # Real videos are messy. AI videos are consistent.
-        # If ANY frame looks extremely fake (score > 2), flag it.
         if max(frame_scores) >= 2.5:
              return "FAKE", 0.95, "Synthetic artifacts found in keyframes."
         elif avg_score >= 1.5:
              return "FAKE", 0.90, "Consistently artificial texture."
         elif avg_score >= 0.8:
-             # Relaxed: Real videos often land here due to compression
              return "SUSPICIOUS", 0.60, "Compression or editing detected."
         else:
              return "REAL", 0.92, "Organic motion and texture."
@@ -155,7 +164,7 @@ def analyze_media(file_path):
         return "ERROR", 0.0, "Analysis Failed"
 
 # --- ENDPOINTS ---
-class UserRequest(BaseModel): email: str # For Profile Fetch
+class UserRequest(BaseModel): email: str 
 class UrlRequest(BaseModel): url: str; email: str
 class UserSignup(BaseModel): name: str; email: str; password: str
 class UserLogin(BaseModel): email: str; password: str
@@ -175,7 +184,7 @@ def check_limits(email):
     c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
     return True
 
-# --- NEW: PROFILE ENDPOINT (FIXES THE 404 ERROR) ---
+# --- THIS IS THE MISSING ENDPOINT (Fixes 404 Error) ---
 @app.post("/user-profile")
 async def get_user_profile(req: UserRequest):
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
@@ -191,6 +200,7 @@ async def get_user_profile(req: UserRequest):
             "plan_name": "Premium Plan" if row[2] else "Free Starter Plan"
         }
     return JSONResponse(content={"status": "error", "message": "User not found"}, status_code=404)
+# ------------------------------------------------------
 
 @app.post("/analyze-url")
 async def analyze_url(req: UrlRequest):
@@ -263,6 +273,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         session = event['data']['object']
         user_email = session.get('client_reference_id') or session.get('customer_email')
         if user_email:
+            print(f"UPGRADING USER: {user_email}")
             conn = sqlite3.connect(DB_NAME); c = conn.cursor()
             c.execute("UPDATE users SET is_premium=1 WHERE email=?", (user_email,))
             conn.commit(); conn.close()
