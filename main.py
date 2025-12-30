@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, Form, Request, Header
-from fastapi.responses import JSONResponse
+# --- FIX: ADDED HTMLResponse HERE ---
+from fastapi.responses import JSONResponse, HTMLResponse 
 from pydantic import BaseModel
 import cv2
 import numpy as np
@@ -36,25 +37,17 @@ def init_db():
 init_db()
 
 # --- V7: TITANIUM GRADE DETECTION ENGINE ---
-# Uses ELA (Error Level Analysis) + Frequency + Noise + Metadata
-
 def perform_ela(img_path):
-    """Checks for compression anomalies common in AI edits."""
     try:
         original = Image.open(img_path).convert('RGB')
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             original.save(tmp.name, 'JPEG', quality=90)
             resaved = Image.open(tmp.name)
-            
-            # Calculate difference (Error)
             ela_img = ImageChops.difference(original, resaved)
             extrema = ela_img.getextrema()
             max_diff = max([ex[1] for ex in extrema])
             scale = 255.0 / max_diff if max_diff > 0 else 1
             ela_img = ImageEnhance.Brightness(ela_img).enhance(scale)
-            
-            # AI often leaves "rainbowing" or flat patches in ELA
-            # We convert to grayscale and check variance
             stat = np.array(ela_img.convert('L'))
             return np.mean(stat), np.var(stat)
     except:
@@ -64,29 +57,25 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
     score = 0.0
     reasons = []
 
-    # 1. PRE-PROCESS
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     
-    # 2. FREQUENCY DOMAIN (The "Invisible Grid" Check)
+    # Frequency Check
     f = np.fft.fft2(gray)
     fshift = np.fft.fftshift(f)
     magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
     rows, cols = gray.shape
     crow, ccol = rows//2, cols//2
-    # Look for high-freq spikes typical of Up-samplers (GANs/Diffusion)
     magnitude_spectrum[crow-20:crow+20, ccol-20:ccol+20] = 0
     freq_energy = np.mean(magnitude_spectrum)
 
-    # 3. ELA CHECK (New Layer)
-    # AI images often have very LOW ELA variance (too consistent)
+    # ELA Check
     ela_mean, ela_var = ela_score
     if ela_var < 50: 
         score += 1.5
         reasons.append("Compression signature is artificially uniform (ELA).")
 
-    # 4. STRICTER FREQUENCY THRESHOLDS
-    # Real photos: 80-140. AI: >160 (Grid) or <50 (Smooth)
+    # Frequency Thresholds
     if freq_energy > 160:
         score += 1.0
         reasons.append(f"Synthetic generation artifacts detected ({int(freq_energy)}).")
@@ -94,11 +83,9 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
         score += 0.5
         reasons.append("Texture lacks natural sensor noise.")
 
-    # 5. SATURATION & LIGHTING (Flux/Midjourney Check)
+    # Lighting Check
     sat_channel = hsv[:,:,1]
     val_channel = hsv[:,:,2]
-    
-    # AI often has "perfect" lighting (High contrast, high saturation)
     if np.mean(sat_channel) > 130 and np.std(val_channel) > 70:
         score += 0.5
         reasons.append("Lighting/Color profile matches diffusion models.")
@@ -107,7 +94,7 @@ def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
 
 def analyze_media(file_path):
     try:
-        # A. METADATA SPY (The easiest catch)
+        # Metadata Check
         try:
             pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
@@ -116,13 +103,12 @@ def analyze_media(file_path):
                 return "FAKE", 0.99, "Metadata tag explicitly identifies AI."
         except: pass
 
-        # B. ELA CALCULATION
+        # ELA Calculation
         ela_data = perform_ela(file_path)
 
-        # C. IMAGE ANALYSIS
+        # Image Logic
         img = cv2.imread(file_path)
         if img is not None:
-            # Resize for consistency (Standardize to 1024px)
             h, w = img.shape[:2]
             if h > 1024 or w > 1024:
                 s = 1024 / max(h, w)
@@ -130,16 +116,15 @@ def analyze_media(file_path):
 
             score, reasons = analyze_pixels_v7(img, ela_data, "Image")
             
-            # AGGRESSIVE SCORING
             if score >= 1.5: return "FAKE", 0.98, reasons[0]
             elif score >= 1.0: return "SUSPICIOUS", 0.75, "High probability of AI manipulation."
             else: return "REAL", 0.94, "Organic sensor pattern confirmed."
 
-        # D. VIDEO ANALYSIS (Consensus Engine)
+        # Video Logic
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened(): return "ERROR", 0.0, "Read Error"
         
-        frames_to_check = 5 # Increase from 3 to 5 for accuracy
+        frames_to_check = 5
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames < 5: return "REAL", 0.80, "Video too short."
 
@@ -147,31 +132,23 @@ def analyze_media(file_path):
         fake_frames = 0
         
         for i in range(frames_to_check):
-            # Jump to random spots in video
             cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(0, total_frames-1))
             ret, frame = cap.read()
             if ret:
-                # Resize frame
                 h, w = frame.shape[:2]
                 if h > 800:
                     s = 800 / max(h, w)
                     frame = cv2.resize(frame, None, fx=s, fy=s)
                 
-                # Analyze frame
-                s_score, _ = analyze_pixels_v7(frame, (0,0), "Video") # Skip ELA for video (too slow)
+                s_score, _ = analyze_pixels_v7(frame, (0,0), "Video")
                 scores.append(s_score)
                 if s_score >= 1.5: fake_frames += 1
 
         cap.release()
 
-        # VIDEO VERDICT
-        # If 40% of frames look Fake -> It's Fake.
-        if fake_frames >= 2:
-            return "FAKE", 0.96, "Inconsistent temporal artifacts (AI Video)."
-        elif sum(scores)/len(scores) > 1.0:
-            return "SUSPICIOUS", 0.70, "Synthetic texture detected in motion."
-        else:
-            return "REAL", 0.92, "Motion flow is organic."
+        if fake_frames >= 2: return "FAKE", 0.96, "Inconsistent temporal artifacts (AI Video)."
+        elif sum(scores)/len(scores) > 1.0: return "SUSPICIOUS", 0.70, "Synthetic texture detected in motion."
+        else: return "REAL", 0.92, "Motion flow is organic."
 
     except Exception as e:
         print(f"ERR: {e}")
@@ -214,7 +191,6 @@ async def analyze_url(req: UrlRequest):
     try:
         sites = ['youtube', 'youtu', 'facebook', 'fb.watch', 'instagram', 'tiktok']
         if any(s in req.url for s in sites): 
-            print(f"Downloading: {req.url}")
             temp_dir = tempfile.mkdtemp()
             ydl_opts = {'format': 'best', 'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 'quiet': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([req.url])
@@ -275,7 +251,6 @@ async def create_checkout_session(req: PaymentRequest):
             client_reference_id=req.email,
             line_items=[{'price_data': {'currency': 'usd', 'product_data': {'name': 'Verify Premium'}, 'unit_amount': 400, 'recurring': {'interval': 'month'}}, 'quantity': 1}],
             mode='subscription', 
-            # FIX: THIS TELLS THE BROWSER TO OPEN YOUR APP
             success_url='verifyapp://payment-success', 
             cancel_url='https://google.com'
         )
@@ -320,7 +295,3 @@ async def reset_action(token: str = Form(...), new_password: str = Form(...)):
     c.execute("UPDATE users SET password=?, reset_token=NULL WHERE reset_token=?", (hash_password(new_password), token))
     conn.commit(); conn.close()
     return "<html><body style='background:#111;color:#0f0;text-align:center;padding:50px'><h1>Success</h1></body></html>"
-
-# --- DOWNLOADERS ---
-def download_video_site(url): return "Deprecated, use logic inside analyze-url" 
-def download_direct(url): return "Deprecated, use logic inside analyze-url"
