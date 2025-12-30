@@ -23,7 +23,10 @@ app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
 # --- CONFIGURATION ---
-stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n"
+# 1. GET THIS FROM STRIPE DASHBOARD -> DEVELOPERS -> API KEYS
+stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
+
+# 2. GET THIS FROM STRIPE DASHBOARD -> DEVELOPERS -> WEBHOOKS -> SIGNING SECRET
 STRIPE_ENDPOINT_SECRET = "whsec_HmhvhPDOimozUwdmH135qmtv6DleLWN7"
 
 EMAIL_USER = os.environ.get("EMAIL_USER")
@@ -42,7 +45,7 @@ def analyze_pixels(img_bgr, source_type="Image"):
     score = 0.0
     reasons = []
 
-    # 1. RESIZE (Standardize input)
+    # 1. RESIZE (Standardize input to prevent Server Crashes)
     height, width = img_bgr.shape[:2]
     max_dim = 1000 # Smaller size reduces compression noise false positives
     if height > max_dim or width > max_dim:
@@ -172,7 +175,7 @@ def check_limits(email):
     c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
     return True
 
-# --- NEW: PROFILE ENDPOINT ---
+# --- NEW: PROFILE ENDPOINT (FIXES THE 404 ERROR) ---
 @app.post("/user-profile")
 async def get_user_profile(req: UserRequest):
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
