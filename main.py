@@ -23,9 +23,9 @@ app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
 # --- CONFIGURATION ---
-# REPLACE THIS WITH YOUR STRIPE SECRET KEY (sk_test_...)
+# REPLACE THIS WITH YOUR STRIPE SECRET KEY
 stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
-# REPLACE THIS WITH YOUR STRIPE WEBHOOK SECRET (whsec_...) found in Stripe Dashboard -> Developers -> Webhooks
+# REPLACE THIS WITH YOUR STRIPE WEBHOOK SECRET
 STRIPE_ENDPOINT_SECRET = "whsec_HmhvhPDOimozUwdmH135qmtv6DleLWN7"
 
 EMAIL_USER = os.environ.get("EMAIL_USER")
@@ -39,13 +39,62 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- CALIBRATED AI DETECTION ENGINE (V4 - Mobile Optimized) ---
+# --- CORE PIXEL ANALYSIS (Used for both Images and Video Frames) ---
+def analyze_pixels(img_bgr, source_type="Image"):
+    score = 0.0
+    reasons = []
+
+    # 1. MEMORY SAVER (Resize)
+    height, width = img_bgr.shape[:2]
+    max_dim = 1200 
+    if height > max_dim or width > max_dim:
+        scale = max_dim / max(height, width)
+        img_bgr = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # 2. FREQUENCY ANALYSIS (Grid Check)
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+    magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
+    
+    rows, cols = gray.shape
+    crow, ccol = rows//2, cols//2
+    mask_size = 40 
+    magnitude_spectrum[crow-mask_size:crow+mask_size, ccol-mask_size:ccol+mask_size] = 0
+    high_freq_energy = np.mean(magnitude_spectrum)
+    
+    # Thresholds
+    if high_freq_energy > 165: 
+        score += 1.0 
+        reasons.append(f"Suspicious grid artifacts detected (Energy: {int(high_freq_energy)}).")
+    elif high_freq_energy < 50: 
+        score += 0.5 
+        reasons.append(f"{source_type} texture is unusually smooth.")
+
+    # 3. SATURATION (Vibrancy)
+    saturation = hsv[:,:,1]
+    mean_sat = np.mean(saturation)
+    if mean_sat > 135: 
+        score += 0.5
+        reasons.append("Color saturation is abnormally high.")
+
+    # 4. LAPLACIAN (Sharpness/Noise)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var < 50:
+            score += 0.5
+            reasons.append("Lacks focal depth (Too flat).")
+    elif laplacian_var > 4500: 
+            score += 0.5
+            reasons.append("Noise levels suggest synthetic grain.")
+
+    return score, reasons
+
+# --- MEDIA HANDLER ---
 def analyze_media(file_path):
     try:
-        score = 0.0
-        reasons = []
-        
-        # 1. METADATA CHECK (Specific AI Generators)
+        # A. METADATA CHECK
         try:
             pil_img = Image.open(file_path)
             exif_data = pil_img.getexif()
@@ -55,78 +104,37 @@ def analyze_media(file_path):
                 return "FAKE", 0.99, "Metadata tag explicitly identifies AI."
         except: pass
 
+        # B. TRY AS IMAGE
         img = cv2.imread(file_path)
-        if img is None:
-            # Video fallback
-            cap = cv2.VideoCapture(file_path)
-            if cap.isOpened():
-                ret, _ = cap.read(); cap.release()
-                if ret: return "REAL", 0.85, "Motion vectors appear organic."
-            return "ERROR", 0.0, "Could not decode media."
+        if img is not None:
+            # It is an image
+            score, reasons = analyze_pixels(img, "Image")
+            # Verdict Logic
+            if score >= 2.0: return "FAKE", 0.96, reasons[0]
+            elif score >= 1.0: return "SUSPICIOUS", 0.65, "Image shows mixed signals."
+            else: return "REAL", 0.94, "Analysis indicates organic origin."
 
-        # --- MEMORY SAVER (Resize) ---
-        height, width = img.shape[:2]
-        max_dim = 1200 # Lowered slightly for speed
-        if height > max_dim or width > max_dim:
-            scale = max_dim / max(height, width)
-            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        
-        # Convert Colors
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # C. TRY AS VIDEO
+        cap = cv2.VideoCapture(file_path)
+        if cap.isOpened():
+            # Grab a frame from the middle of the video
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count > 10:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
+            
+            ret, frame = cap.read()
+            cap.release()
+            
+            if ret:
+                # Analyze the VIDEO FRAME as if it were an image
+                score, reasons = analyze_pixels(frame, "Video Frame")
+                
+                # Video needs slightly stricter logic because compression hides artifacts
+                if score >= 1.5: return "FAKE", 0.95, "Video frames contain synthetic artifacts."
+                elif score >= 1.0: return "SUSPICIOUS", 0.70, "Video texture is inconsistent."
+                else: return "REAL", 0.90, "Video motion and texture appear organic."
 
-        # TEST 2: FREQUENCY ANALYSIS (Grid Check)
-        f = np.fft.fft2(gray)
-        fshift = np.fft.fftshift(f)
-        magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
-        
-        rows, cols = gray.shape
-        crow, ccol = rows//2, cols//2
-        mask_size = 40 
-        magnitude_spectrum[crow-mask_size:crow+mask_size, ccol-mask_size:ccol+mask_size] = 0
-        high_freq_energy = np.mean(magnitude_spectrum)
-        
-        # --- TUNED THRESHOLDS FOR RESIZED IMAGES ---
-        # Real photos usually land between 80 - 140 after resizing.
-        # AI usually lands > 160 (Grid) or < 60 (Plastic smooth).
-        
-        if high_freq_energy > 165: # Raised from 135 to avoid false positives on detailed textures
-            score += 1.0 
-            reasons.append(f"Suspicious grid artifacts detected (Energy: {int(high_freq_energy)}).")
-        elif high_freq_energy < 50: # Lowered from 75 because resizing causes smoothing
-            score += 0.5 # Reduced weight
-            reasons.append("Texture is unusually smooth.")
-
-        # TEST 3: SATURATION (Vibrancy)
-        saturation = hsv[:,:,1]
-        mean_sat = np.mean(saturation)
-        # Modern phones (Samsung/iPhone) have high saturation (HDR). 
-        # Raised threshold to 135 (was 110).
-        if mean_sat > 135: 
-            score += 0.5
-            reasons.append("Color saturation is abnormally high.")
-
-        # TEST 4: LAPLACIAN (Sharpness/Noise)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        
-        # Lowered "too flat" threshold to 50 for low-light support
-        if laplacian_var < 50:
-             score += 0.5
-             reasons.append("Image lacks depth (Too flat).")
-        elif laplacian_var > 4500: # Very noisy
-             score += 0.5
-             reasons.append("Noise levels suggest synthetic grain.")
-
-        # --- FINAL VERDICT ---
-        print(f"DEBUG: Score={score}, Reasons={reasons}")
-        
-        # We now require a higher score to call it FAKE (Guilty beyond reasonable doubt)
-        if score >= 2.0:
-            return "FAKE", 0.96, reasons[0]
-        elif score >= 1.0:
-            return "SUSPICIOUS", 0.65, "Image shows mixed signals."
-        else:
-            return "REAL", 0.94, "Analysis indicates organic origin."
+        return "ERROR", 0.0, "Could not decode media file."
 
     except Exception as e:
         print(f"Analysis Error: {e}")
@@ -164,8 +172,7 @@ def check_limits(email):
     u = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
     conn.close()
     if not u: return False
-    # If premium, unlimited scans. If not, limit to 3.
-    if u[1] == 1: return True
+    if u[1] == 1: return True # Premium = Unlimited
     if u[0] >= 3: return False
     
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
@@ -221,18 +228,17 @@ async def login(user: UserLogin):
     if row: return {"status": "success", "username": row[0], "scan_count": row[2], "is_premium": bool(row[3])}
     return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
 
-# --- NEW: STRIPE PAYMENT WITH WEBHOOK ---
+# --- STRIPE PAYMENT ---
 @app.post("/create-checkout-session")
 async def create_checkout_session(req: PaymentRequest):
     try:
-        # We pass the user's email as metadata so the Webhook knows who to upgrade
         cs = stripe.checkout.Session.create(
             payment_method_types=['card'],
             customer_email=req.email,
             client_reference_id=req.email,
             line_items=[{'price_data': {'currency': 'usd', 'product_data': {'name': 'Verify Premium'}, 'unit_amount': 400, 'recurring': {'interval': 'month'}}, 'quantity': 1}],
             mode='subscription', 
-            success_url='https://google.com', # In a real app, this should be a "Thank you" page
+            success_url='https://google.com', 
             cancel_url='https://google.com'
         )
         return {"status": "success", "url": cs.url}
@@ -246,17 +252,14 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
 
-    # LISTEN FOR SUCCESSFUL PAYMENT
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        # Retrieve user email from the session
         user_email = session.get('client_reference_id') or session.get('customer_email')
         
         if user_email:
             print(f"UPGRADING USER: {user_email}")
             conn = sqlite3.connect(DB_NAME)
             c = conn.cursor()
-            # Set is_premium = 1 (True)
             c.execute("UPDATE users SET is_premium=1 WHERE email=?", (user_email,))
             conn.commit()
             conn.close()
