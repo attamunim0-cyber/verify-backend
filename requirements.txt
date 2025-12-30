@@ -1,10 +1,9 @@
 fastapi
 uvicorn
-requests
-boto3
-pydantic
 python-multipart
+requests
 opencv-python-headless
+numpy
 stripe
 yt-dlp
 Pillow
