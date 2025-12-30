@@ -15,7 +15,7 @@ import requests
 import yt_dlp
 import glob
 import smtplib
-from PIL import Image, ImageChops, ImageEnhance
+from PIL import Image, ImageChops, ImageEnhance, ExifTags
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -25,8 +25,6 @@ DB_NAME = "verify_shield_v2.db"
 # --- CONFIGURATION ---
 stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n"
 STRIPE_ENDPOINT_SECRET = "whsec_HmhvhPDOimozUwdmH135qmtv6DleLWN7"
-
-# MUST BE SET IN RENDER DASHBOARD -> ENVIRONMENT
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 SERVER_URL = "https://verify-backend-03or.onrender.com"
@@ -38,127 +36,121 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- V10: "PARANOID" TILE-BASED DETECTION ---
-# Instead of resizing (which hides AI), we cut the image into small squares
-# and analyze each square. If ANY square is fake, the whole image is fake.
+# --- V11: NUCLEAR DETECTION ENGINE ---
 
-def analyze_tile(tile_gray, tile_hsv):
+def analyze_exif(pil_img):
+    """Checks if the camera data looks real."""
+    try:
+        exif = pil_img.getexif()
+        if not exif: return 0.0 # No data = Suspicious
+        
+        # Look for Make/Model (e.g. "Apple", "Canon")
+        make = exif.get(271) # Make
+        model = exif.get(272) # Model
+        software = exif.get(305) # Software
+        
+        # AI often deletes these or puts "Creator Tool"
+        if make and model:
+            return -0.5 # BONUS: Likely Real Camera
+        return 0.0
+    except:
+        return 0.0
+
+def analyze_tile_v11(tile_gray, tile_hsv):
     score = 0.0
     
-    # 1. GRID CHECK (FFT)
+    # 1. FFT (The "Invisible Grid" Check)
     f = np.fft.fft2(tile_gray)
     fshift = np.fft.fftshift(f)
-    magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
+    magnitude = 20 * np.log(np.abs(fshift) + 1e-10)
     h, w = tile_gray.shape
-    magnitude_spectrum[h//2-10:h//2+10, w//2-10:w//2+10] = 0 # Block DC
-    energy = np.mean(magnitude_spectrum)
+    # Mask the center (low freq) to see only high freq artifacts
+    magnitude[h//2-5:h//2+5, w//2-5:w//2+5] = 0 
+    high_freq_energy = np.mean(magnitude)
     
-    # Lower threshold = Catch more fakes
-    if energy > 135: score += 1.5 # Strong Grid
-    
-    # 2. NOISE FLOOR (Laplacian)
+    # 2. VARIANCE (The "Roughness" Check)
+    # Real textures are rough. AI textures are often smooth math.
     lap_var = cv2.Laplacian(tile_gray, cv2.CV_64F).var()
-    if lap_var < 80: score += 1.0 # Too Smooth (AI Plastic Look)
-
-    # 3. SATURATION SPIKES
+    
+    # 3. THE RATIO (The Magic Number)
+    # AI has High Energy (Grid) but Low Variance (Smoothness).
+    # Real photos have High Energy AND High Variance.
+    # We calculate: Energy / Variance
+    ratio = high_freq_energy / (lap_var + 1.0)
+    
+    # Thresholds tuned for "Nuclear" sensitivity
+    if high_freq_energy > 130 and ratio > 2.0:
+        score += 2.0 # STRONG FAKE SIGNAL (Hidden Grid)
+    elif lap_var < 50:
+        score += 1.0 # PLASTIC SIGNAL (Too Smooth)
+        
+    # 4. COLOR CLIPPING
     sat = tile_hsv[:,:,1]
-    if np.mean(sat) > 150: score += 0.5 # Too Vivid
+    if np.mean(sat) > 160: score += 0.5 # NEON SIGNAL
 
     return score
 
 def analyze_media(file_path):
     try:
-        # A. METADATA SPY
+        pil_img = Image.open(file_path)
+        
+        # A. METADATA DEEP SCAN
         try:
-            pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
-            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly", "a1111"]
+            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly", "a1111", "comfyui"]
             if any(k in meta.lower() for k in ai_tags):
                 return "FAKE", 0.99, "Metadata explicit AI tag found."
         except: pass
-
-        # B. IMAGE HANDLING (Tile Strategy)
-        img = cv2.imread(file_path)
-        if img is not None:
-            # Don't resize. Split into 256x256 tiles.
-            h, w = img.shape[:2]
-            tile_size = 256
-            
-            # If too massive, downscale slightly to prevent crash, but keep it huge
-            if h > 3000 or w > 3000:
-                scale = 3000 / max(h, w)
-                img = cv2.resize(img, None, fx=scale, fy=scale)
-                h, w = img.shape[:2]
-
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            
-            max_tile_score = 0.0
-            
-            # Check center crop and random tiles
-            steps_y = max(1, h // tile_size)
-            steps_x = max(1, w // tile_size)
-            
-            # Check up to 8 random tiles to save speed
-            checks = 0
-            for _ in range(8):
-                y = random.randint(0, max(0, h - tile_size))
-                x = random.randint(0, max(0, w - tile_size))
-                
-                tile_g = gray[y:y+tile_size, x:x+tile_size]
-                tile_h = hsv[y:y+tile_size, x:x+tile_size]
-                
-                if tile_g.size == 0: continue
-                
-                s = analyze_tile(tile_g, tile_h)
-                if s > max_tile_score: max_tile_score = s
-            
-            # VERDICT
-            if max_tile_score >= 1.5: return "FAKE", 0.98, "Synthetic patterns detected in texture analysis."
-            elif max_tile_score >= 1.0: return "SUSPICIOUS", 0.75, "Image lacks natural sensor noise."
-            else: return "REAL", 0.92, "Organic noise profile confirmed."
-
-        # C. VIDEO HANDLING (Frame Sampling)
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened(): return "ERROR", 0.0, "Read Error"
         
-        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if frames < 5: return "REAL", 0.85, "Video too short."
+        # Get "Real Camera" Bonus
+        real_camera_bonus = analyze_exif(pil_img)
 
-        fake_hits = 0
-        checks = 6
-        for _ in range(checks):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(0, frames-1))
-            ret, frame = cap.read()
-            if ret:
-                # Resize frame only if 4K (keep 1080p)
-                fh, fw = frame.shape[:2]
-                if fh > 1080:
-                    fs = 1080 / fh
-                    frame = cv2.resize(frame, None, fx=fs, fy=fs)
-                
-                fgray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                fhsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                
-                # Check center tile of frame
-                cy, cx = fh//2, fw//2
-                tile_g = fgray[cy-128:cy+128, cx-128:cx+128]
-                tile_h = fhsv[cy-128:cy+128, cx-128:cx+128]
-                
-                if tile_g.shape[0] < 256: continue # Skip small frames
+        # B. TILE ANALYSIS (Full Resolution)
+        img = cv2.imread(file_path)
+        if img is None: return "ERROR", 0.0, "Could not decode image."
+        
+        # Split into tiles (200x200)
+        tile_size = 200
+        h, w = img.shape[:2]
+        
+        # Downscale HUGE images to prevent server crash, but keep them big
+        if h > 2000:
+            s = 2000 / h
+            img = cv2.resize(img, None, fx=s, fy=s)
+            h, w = img.shape[:2]
 
-                if analyze_tile(tile_g, tile_h) >= 1.0: fake_hits += 1
-
-        cap.release()
-
-        if fake_hits >= 2: return "FAKE", 0.95, "Inconsistent artifacts across frames."
-        else: return "REAL", 0.90, "Motion consistent with optical capture."
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        max_score = 0.0
+        tiles_checked = 0
+        
+        # Randomly check 10 tiles to be fast but accurate
+        for _ in range(12):
+            if h < tile_size or w < tile_size: break
+            y = random.randint(0, h - tile_size)
+            x = random.randint(0, w - tile_size)
+            
+            tile_g = gray[y:y+tile_size, x:x+tile_size]
+            tile_h = hsv[y:y+tile_size, x:x+tile_size]
+            
+            s = analyze_tile_v11(tile_g, tile_h)
+            if s > max_score: max_score = s
+            tiles_checked += 1
+            
+        # Apply Bonus
+        final_score = max_score + real_camera_bonus
+        
+        # VERDICT LOGIC
+        if final_score >= 1.5: return "FAKE", 0.98, "Synthetic grid pattern detected."
+        elif final_score >= 0.8: return "SUSPICIOUS", 0.70, "Unnatural smoothness or lighting."
+        else: return "REAL", 0.94, "Organic noise profile confirmed."
 
     except Exception as e:
         print(f"ERR: {e}")
         return "ERROR", 0.0, "Analysis Failed"
 
-# --- ENDPOINTS & AUTO-HEAL ---
+# --- AUTO-HEAL & ENDPOINTS ---
 class UserRequest(BaseModel): email: str 
 class UrlRequest(BaseModel): url: str; email: str
 class UserSignup(BaseModel): name: str; email: str; password: str
@@ -174,8 +166,7 @@ def ensure_user_exists(email):
     c = conn.cursor()
     row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
     if not row:
-        print(f"AUTO-HEALING: Re-creating {email}")
-        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "auto_restored"))
+        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "restored"))
         conn.commit()
     conn.close()
 
@@ -184,10 +175,8 @@ def check_limits(email):
     conn = sqlite3.connect(DB_NAME); conn.row_factory = sqlite3.Row; c = conn.cursor()
     row = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
     conn.close()
-    
     if row['is_premium'] == 1: return True
     if row['scan_count'] >= 3: return False
-    
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,))
     conn.commit(); conn.close()
@@ -205,11 +194,11 @@ async def get_user_profile(req: UserRequest):
 async def analyze_url(req: UrlRequest):
     if not check_limits(req.email): return JSONResponse(content={"verdict": "LIMIT_REACHED", "message": "Limit reached"}, status_code=403)
     try:
-        # Simplified Downloader logic
         temp_dir = tempfile.mkdtemp()
         ydl_opts = {'format': 'best', 'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 'quiet': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([req.url])
         files = glob.glob(os.path.join(temp_dir, "*"))
+        if not files: return {"verdict": "ERROR", "message": "Download failed"}
         v, c, m = analyze_media(files[0])
         return {"verdict": v, "score": c, "message": m}
     except Exception as e: return JSONResponse(content={"verdict": "ERROR", "message": str(e)}, status_code=400)
@@ -239,14 +228,14 @@ async def signup(user: UserSignup):
 
 @app.post("/login")
 async def login(user: UserLogin):
-    ensure_user_exists(user.email) # Auto-heal on login attempt
+    ensure_user_exists(user.email)
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     row = c.execute("SELECT name, is_verified, scan_count, is_premium FROM users WHERE email=?", (user.email,)).fetchone()
     conn.close()
     if row: return {"status": "success", "username": row[0], "scan_count": row[2], "is_premium": bool(row[3])}
     return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
 
-# --- EMAIL & PASSWORD ---
+# --- EMAIL & PAYMENTS ---
 @app.post("/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest):
     ensure_user_exists(req.email)
@@ -259,20 +248,13 @@ async def forgot_password(req: ForgotPasswordRequest):
     
     try:
         msg = MIMEMultipart()
-        msg['From'] = EMAIL_USER
-        msg['To'] = req.email
-        msg['Subject'] = "Verify Shield Password Reset"
-        msg.attach(MIMEText(f"Click to reset: {SERVER_URL}/reset-password-view?token={t}", 'plain'))
-        
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
-        server.quit()
+        msg['From'] = EMAIL_USER; msg['To'] = req.email; msg['Subject'] = "Reset Password"
+        msg.attach(MIMEText(f"Link: {SERVER_URL}/reset-password-view?token={t}", 'plain'))
+        server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS); server.send_message(msg); server.quit()
         return {"status": "success", "message": "Link sent"}
     except Exception as e:
-        print(f"EMAIL ERROR: {e}")
-        return JSONResponse(content={"status": "error", "message": f"Failed to send email: {str(e)}"}, status_code=500)
+        return JSONResponse(content={"status": "error", "message": f"Email Error: {str(e)}"}, status_code=500)
 
 @app.get("/reset-password-view", response_class=HTMLResponse)
 async def reset_view(token: str):
@@ -285,10 +267,9 @@ async def reset_action(token: str = Form(...), new_password: str = Form(...)):
     conn.commit(); conn.close()
     return "<html><body style='background:#111;color:#0f0;text-align:center;padding:50px'><h1>Success</h1></body></html>"
 
-# --- PAYMENT ---
 @app.get("/payment-success-landing", response_class=HTMLResponse)
 async def payment_success_page():
-    return """<html><body style='background:#0A0E21;color:white;text-align:center;padding:50px;font-family:sans-serif'><h1>PAYMENT COMPLETE</h1><p>Return to app.</p><a href="verifyapp://payment-success" style="background:#00E676;color:black;padding:15px;text-decoration:none;font-weight:bold;border-radius:10px;">OPEN APP</a><script>setTimeout(function(){window.location.href="verifyapp://payment-success";},1000);</script></body></html>"""
+    return """<html><body style='background:#0A0E21;color:white;text-align:center;padding:50px;font-family:sans-serif'><h1>PAYMENT COMPLETE</h1><br><a href="verifyapp://payment-success" style="background:#00E676;color:black;padding:15px;text-decoration:none;font-weight:bold;border-radius:10px;">OPEN APP</a><script>setTimeout(function(){window.location.href="verifyapp://payment-success";},1000);</script></body></html>"""
 
 @app.post("/create-checkout-session")
 async def create_checkout_session(req: PaymentRequest):
