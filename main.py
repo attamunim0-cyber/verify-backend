@@ -1,5 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, Form, Request, Header
-from fastapi.responses import JSONResponse, HTMLResponse 
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 import cv2
 import numpy as np
@@ -21,7 +21,7 @@ app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
 # --- CONFIGURATION ---
-stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n" 
+stripe.api_key = "sk_test_51Q2kAoCFpfwvg3QdGGP7uAibYjbJCv9mqorL582t1Tp2uXtGcNLgyAFRfqYN8eNqpnLhvOAk5zNGkfN4wDp4QtR000JjAFj72n"
 STRIPE_ENDPOINT_SECRET = "whsec_HmhvhPDOimozUwdmH135qmtv6DleLWN7"
 
 EMAIL_USER = os.environ.get("EMAIL_USER")
@@ -35,131 +35,102 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- V8: AUTO-HEAL USER LOGIC ---
-def get_or_create_user(email):
-    """If DB was wiped by Render, re-create the user automatically."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    
-    if not row:
-        # AUTO-HEAL: Create a fresh user so they aren't blocked
-        print(f"DEBUG: Auto-Creating user {email}")
-        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "hash",))
-        conn.commit()
-        row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    
-    conn.close()
-    return row
-
-def check_limits(email):
-    # This now gets OR creates the user, so it never returns False for missing users
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row # Allow column access
-    c = conn.cursor()
-    
-    # 1. Ensure user exists
-    c.execute("INSERT OR IGNORE INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "temp"))
-    conn.commit()
-    
-    # 2. Check limits
-    row = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
-    conn.close()
-    
-    if row['is_premium'] == 1: return True
-    if row['scan_count'] >= 3: return False
-    
-    # Increment scan count
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,))
-    conn.commit()
-    conn.close()
-    return True
-
-# --- DETECTION ENGINE ---
-def perform_ela(img_path):
-    try:
-        original = Image.open(img_path).convert('RGB')
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            original.save(tmp.name, 'JPEG', quality=90)
-            resaved = Image.open(tmp.name)
-            ela_img = ImageChops.difference(original, resaved)
-            extrema = ela_img.getextrema()
-            max_diff = max([ex[1] for ex in extrema])
-            scale = 255.0 / max_diff if max_diff > 0 else 1
-            ela_img = ImageEnhance.Brightness(ela_img).enhance(scale)
-            stat = np.array(ela_img.convert('L'))
-            return np.mean(stat), np.var(stat)
-    except: return 0, 0
-
-def analyze_pixels_v7(img_bgr, ela_score, source_type="Image"):
+# --- V9: ADAPTIVE TITANIUM DETECTION ENGINE ---
+def analyze_pixels_adaptive(img_bgr, source_type="Image"):
     score = 0.0
     reasons = []
 
+    # 1. PREP
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     
+    # 2. ADAPTIVE NOISE FLOOR CALCULATION
+    # Instead of a fixed number, we measure the image's own natural noise.
+    # Real photos have consistent Gaussian noise. AI has "patches" of silence.
+    sigma = np.std(gray)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    
+    # 3. FREQUENCY DOMAIN (GRID CHECK)
     f = np.fft.fft2(gray)
     fshift = np.fft.fftshift(f)
     magnitude_spectrum = 20 * np.log(np.abs(fshift) + 1e-10)
+    
     rows, cols = gray.shape
     crow, ccol = rows//2, cols//2
-    magnitude_spectrum[crow-20:crow+20, ccol-20:ccol+20] = 0
+    # Mask low frequencies (content) to see only high frequencies (artifacts)
+    magnitude_spectrum[crow-30:crow+30, ccol-30:ccol+30] = 0
     freq_energy = np.mean(magnitude_spectrum)
 
-    ela_mean, ela_var = ela_score
-    if ela_var < 50: 
+    # --- DYNAMIC THRESHOLDS ---
+    # Adjust sensitivity based on how "busy" the image is (sigma)
+    
+    # TEST A: THE "MIDJOURNEY GRID"
+    # AI Generators leave a grid signature > 165 usually.
+    # But high-detail Real photos can also be high. We check ratio vs sigma.
+    grid_ratio = freq_energy / (sigma + 1e-5)
+    
+    if freq_energy > 170 and grid_ratio > 3.5:
         score += 1.5
-        reasons.append("Compression signature is artificially uniform (ELA).")
-
-    if freq_energy > 160:
+        reasons.append(f"Synthetic grid artifacts detected (Energy: {int(freq_energy)}).")
+    
+    # TEST B: THE "SMOOTHNESS TRAP" (Plastic Skin)
+    # Real photos have grain. If variance is super low, it's likely AI or heavily filtered.
+    # Lower threshold for video because compression kills grain.
+    smooth_floor = 30 if source_type == "Video" else 60
+    
+    if laplacian_var < smooth_floor:
         score += 1.0
-        reasons.append(f"Synthetic generation artifacts detected ({int(freq_energy)}).")
-    elif freq_energy < 45:
-        score += 0.5
-        reasons.append("Texture lacks natural sensor noise.")
+        reasons.append("Texture is unnaturally smooth (Plastic signature).")
 
-    sat_channel = hsv[:,:,1]
-    val_channel = hsv[:,:,2]
-    if np.mean(sat_channel) > 130 and np.std(val_channel) > 70:
+    # TEST C: COLOR CLIPPING (Saturation)
+    # AI over-saturates colors.
+    sat = hsv[:,:,1]
+    bright = hsv[:,:,2]
+    # Check for "Neon" colors common in AI
+    high_sat_ratio = np.sum(sat > 240) / sat.size
+    if high_sat_ratio > 0.05: # If >5% of pixels are MAX saturation
         score += 0.5
-        reasons.append("Lighting/Color profile matches diffusion models.")
+        reasons.append("Unnatural color saturation peaks.")
 
     return score, reasons
 
 def analyze_media(file_path):
     try:
+        # A. METADATA SPY
         try:
             pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
-            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "adobe firefly", "imagined"]
+            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly"]
             if any(k in meta.lower() for k in ai_tags):
                 return "FAKE", 0.99, "Metadata tag explicitly identifies AI."
         except: pass
 
-        ela_data = perform_ela(file_path)
+        # B. IMAGE ANALYSIS
         img = cv2.imread(file_path)
         if img is not None:
+            # Resize smartly - keep enough detail for grid detection
             h, w = img.shape[:2]
-            if h > 1024 or w > 1024:
-                s = 1024 / max(h, w)
+            if h > 1200 or w > 1200:
+                s = 1200 / max(h, w)
                 img = cv2.resize(img, None, fx=s, fy=s)
-            score, reasons = analyze_pixels_v7(img, ela_data, "Image")
+
+            score, reasons = analyze_pixels_adaptive(img, "Image")
+            
             if score >= 1.5: return "FAKE", 0.98, reasons[0]
-            elif score >= 1.0: return "SUSPICIOUS", 0.75, "High probability of AI manipulation."
+            elif score >= 1.0: return "SUSPICIOUS", 0.70, "Mixed organic/digital signals."
             else: return "REAL", 0.94, "Organic sensor pattern confirmed."
 
+        # C. VIDEO ANALYSIS (Jitter Check)
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened(): return "ERROR", 0.0, "Read Error"
         
-        frames_to_check = 5
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames < 5: return "REAL", 0.80, "Video too short."
+        if total_frames < 5: return "REAL", 0.85, "Video too short."
 
+        # Analyze 6 frames to catch "Flicker"
         scores = []
-        fake_frames = 0
-        for i in range(frames_to_check):
+        frames_to_check = 6
+        for _ in range(frames_to_check):
             cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(0, total_frames-1))
             ret, frame = cap.read()
             if ret:
@@ -167,17 +138,28 @@ def analyze_media(file_path):
                 if h > 800:
                     s = 800 / max(h, w)
                     frame = cv2.resize(frame, None, fx=s, fy=s)
-                s_score, _ = analyze_pixels_v7(frame, (0,0), "Video")
+                s_score, _ = analyze_pixels_adaptive(frame, "Video")
                 scores.append(s_score)
-                if s_score >= 1.5: fake_frames += 1
         cap.release()
 
-        if fake_frames >= 2: return "FAKE", 0.96, "Inconsistent temporal artifacts (AI Video)."
-        elif sum(scores)/len(scores) > 1.0: return "SUSPICIOUS", 0.70, "Synthetic texture detected in motion."
-        else: return "REAL", 0.92, "Motion flow is organic."
+        # VIDEO VERDICT LOGIC
+        avg_score = sum(scores) / len(scores)
+        # AI Video often flickers between "Very Fake" and "Okay". 
+        # Real video is consistently "Okay".
+        variance = np.var(scores)
+        
+        if avg_score >= 1.2:
+            return "FAKE", 0.96, "Consistently artificial texture."
+        elif variance > 0.5:
+             # High variance means the style changes frame-to-frame (AI hallucination)
+             return "FAKE", 0.92, "Temporal instability detected (AI Flicker)."
+        elif avg_score >= 0.8:
+            return "SUSPICIOUS", 0.65, "Compression or editing detected."
+        else:
+            return "REAL", 0.90, "Organic motion confirmed."
 
     except Exception as e:
-        print(f"ERR: {e}")
+        print(f"Error: {e}")
         return "ERROR", 0.0, "Analysis Failed"
 
 # --- ENDPOINTS ---
@@ -190,22 +172,34 @@ class ForgotPasswordRequest(BaseModel): email: str
 
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
-@app.post("/user-profile")
-async def get_user_profile(req: UserRequest):
-    # AUTO-HEAL: Create user if missing
-    conn = sqlite3.connect(DB_NAME)
+def check_limits(email):
+    conn = sqlite3.connect(DB_NAME); 
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     
-    # Try to find user
+    # AUTO-HEAL: Ensure user exists before checking limits
+    c.execute("INSERT OR IGNORE INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "hash"))
+    conn.commit()
+    
+    row = c.execute("SELECT scan_count, is_premium FROM users WHERE email=?", (email,)).fetchone()
+    conn.close()
+    
+    if row['is_premium'] == 1: return True
+    if row['scan_count'] >= 3: return False
+    
+    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
+    c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
+    return True
+
+@app.post("/user-profile")
+async def get_user_profile(req: UserRequest):
+    conn = sqlite3.connect(DB_NAME); conn.row_factory = sqlite3.Row; c = conn.cursor()
+    
+    # AUTO-HEAL
+    c.execute("INSERT OR IGNORE INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (req.email, "User", "restored"))
+    conn.commit()
+    
     row = c.execute("SELECT name, email, is_premium, scan_count FROM users WHERE email=?", (req.email,)).fetchone()
-    
-    if not row:
-        # User missing (DB wipe)? Create them now!
-        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (req.email, "User", "restored"))
-        conn.commit()
-        row = c.execute("SELECT name, email, is_premium, scan_count FROM users WHERE email=?", (req.email,)).fetchone()
-    
     conn.close()
     return {"status": "success", "name": row['name'], "email": row['email'], "is_premium": bool(row['is_premium']), "scan_count": row['scan_count'], "plan_name": "Premium Plan" if row['is_premium'] else "Starter Plan"}
 
@@ -266,6 +260,36 @@ async def login(user: UserLogin):
     if row: return {"status": "success", "username": row[0], "scan_count": row[2], "is_premium": bool(row[3])}
     return JSONResponse(content={"status": "error", "message": "Invalid credentials"}, status_code=401)
 
+# --- NEW: PAYMENT SUCCESS LANDING PAGE ---
+# This page is shown in the browser after payment.
+# It has a button that forces the App to open.
+@app.get("/payment-success-landing", response_class=HTMLResponse)
+async def payment_success_page():
+    return """
+    <html>
+    <head>
+        <title>Payment Successful</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { background-color: #0A0E21; color: white; font-family: sans-serif; text-align: center; padding: 50px; }
+            .btn { background-color: #00E676; color: black; padding: 15px 30px; text-decoration: none; font-size: 20px; border-radius: 10px; display: inline-block; margin-top: 20px; font-weight: bold;}
+            h1 { color: #00E676; }
+        </style>
+    </head>
+    <body>
+        <h1>PAYMENT COMPLETE</h1>
+        <p>Your account has been upgraded to Premium.</p>
+        <p>Click below to return to the app.</p>
+        <a href="verifyapp://payment-success" class="btn">OPEN VERIFY SHIELD</a>
+        
+        <script>
+            // Try to auto-open app
+            setTimeout(function() { window.location.href = "verifyapp://payment-success"; }, 1000);
+        </script>
+    </body>
+    </html>
+    """
+
 @app.post("/create-checkout-session")
 async def create_checkout_session(req: PaymentRequest):
     try:
@@ -275,7 +299,8 @@ async def create_checkout_session(req: PaymentRequest):
             client_reference_id=req.email,
             line_items=[{'price_data': {'currency': 'usd', 'product_data': {'name': 'Verify Premium'}, 'unit_amount': 400, 'recurring': {'interval': 'month'}}, 'quantity': 1}],
             mode='subscription', 
-            success_url='verifyapp://payment-success', 
+            # FIX: Send to our new HTML Landing Page
+            success_url=f'{SERVER_URL}/payment-success-landing', 
             cancel_url='https://google.com'
         )
         return {"status": "success", "url": cs.url}
@@ -293,9 +318,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         user_email = session.get('client_reference_id') or session.get('customer_email')
         if user_email:
             conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-            # AUTO-HEAL: If user is missing from DB (wipe), create them first
             c.execute("INSERT OR IGNORE INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (user_email, "PaidUser", "hash"))
-            # Then upgrade them
             c.execute("UPDATE users SET is_premium=1 WHERE email=?", (user_email,))
             conn.commit(); conn.close()
     return {"status": "success"}
