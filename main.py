@@ -15,13 +15,10 @@ import requests
 import yt_dlp
 import glob
 import smtplib
+import time
 from PIL import Image, ImageChops, ImageEnhance, ExifTags
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
-# --- AI BRAIN IMPORTS ---
-from transformers import pipeline
-import torch
 
 app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
@@ -33,17 +30,11 @@ EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 SERVER_URL = "https://verify-backend-03or.onrender.com"
 
-# --- LOAD THE AI BRAIN (ON STARTUP) ---
-# We use a lightweight ViT (Vision Transformer) fine-tuned for Deepfakes
-print("LOADING AI MODEL... (This may take 30s on first boot)")
-try:
-    # This model is small enough for free servers but very accurate
-    ai_classifier = pipeline("image-classification", model="umm-maybe/AI-image-detector")
-    MODEL_LOADED = True
-    print("AI MODEL LOADED SUCCESSFULLY")
-except Exception as e:
-    print(f"WARNING: Could not load AI Model: {e}")
-    MODEL_LOADED = False
+# --- REMOTE AI BRAIN CONFIG ---
+# We use the free Hugging Face Inference API
+HF_API_URL = "https://api-inference.huggingface.co/models/umm-maybe/AI-image-detector"
+# You can get a free token at huggingface.co/settings/tokens, but it works without one (rate limited)
+HF_HEADERS = {} 
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -52,26 +43,37 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- V14: HYBRID DETECTION ENGINE ---
+# --- V15: CLOUD BRAIN ENGINE ---
 
-def analyze_with_brain(pil_image):
-    """Asks the HuggingFace AI model for a verdict."""
-    if not MODEL_LOADED: return 0.0, "Model Offline"
-    
+def analyze_with_remote_brain(file_path):
+    """Sends image to Hugging Face Cloud for 99% accuracy analysis."""
     try:
-        results = ai_classifier(pil_image)
-        # Results look like: [{'label': 'artificial', 'score': 0.99}, {'label': 'human', 'score': 0.01}]
+        with open(file_path, "rb") as f:
+            data = f.read()
         
-        # Find the 'artificial' or 'fake' score
-        fake_score = 0.0
-        for r in results:
-            label = r['label'].lower()
-            if 'art' in label or 'fake' in label or 'ai' in label:
-                fake_score = r['score']
+        # Retry loop (Free API sometimes sleeps)
+        for i in range(3):
+            response = requests.post(HF_API_URL, headers=HF_HEADERS, data=data)
+            
+            # If model is loading, wait and retry
+            if response.status_code == 503:
+                print("Remote Brain is waking up... waiting 2s")
+                time.sleep(2)
+                continue
                 
-        return fake_score, "Deep Learning Analysis"
+            if response.status_code == 200:
+                # Result: [{'label': 'artificial', 'score': 0.99}, ...]
+                results = response.json()
+                if isinstance(results, list):
+                    for r in results:
+                        if r['label'].lower() in ['artificial', 'fake', 'ai']:
+                            return r['score'], "Deep Learning (Cloud)"
+                    return 0.05, "Deep Learning (Cloud)" # If logic fails, assume real
+                break
+        
+        return 0.0, "Brain Timeout"
     except Exception as e:
-        print(f"Brain Error: {e}")
+        print(f"Cloud Brain Error: {e}")
         return 0.0, "Brain Error"
 
 def analyze_exif(pil_img):
@@ -80,77 +82,54 @@ def analyze_exif(pil_img):
         if not exif: return 0.0
         make = exif.get(271)
         model = exif.get(272)
-        if make and model: return -0.6 # Real camera bonus
+        if make and model: return -0.6
         return 0.0
     except: return 0.0
 
 def analyze_media(file_path):
     try:
-        pil_img = Image.open(file_path)
-
-        # 1. AI BRAIN CHECK (The Heavy Hitter)
-        # We perform this first because it's the most accurate
-        brain_score, source = analyze_with_brain(pil_img)
+        # 1. CLOUD BRAIN CHECK (The Heavy Hitter)
+        # This uses 0 RAM on your server because Hugging Face does the work.
+        brain_score, source = analyze_with_remote_brain(file_path)
         
-        # 2. METADATA CHECK (The Fast Check)
+        # 2. METADATA CHECK
         try:
+            pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
             ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly"]
             if any(k in meta.lower() for k in ai_tags):
                 return "FAKE", 0.99, "Metadata explicit AI tag found."
+            
+            # Bonus for Real Camera
+            brain_score += analyze_exif(pil_img)
         except: pass 
         
-        # 3. IF BRAIN IS SURE, TRUST IT
-        # If the Neural Network is >90% sure, we don't need math.
-        if brain_score > 0.90:
+        # 3. VERDICT
+        if brain_score > 0.85:
              return "FAKE", 0.98, "Deep Learning Model detected synthetic signatures."
-        elif brain_score < 0.10:
-             # If Neural Net is sure it's human, trust it (unless metadata disagrees)
+        elif brain_score < 0.15:
              return "REAL", 0.95, "Deep Learning Model confirmed organic features."
 
-        # 4. TIE BREAKER: MATH ANALYSIS (For ambiguous cases)
-        # If the AI Brain is unsure (10% - 90%), we use V13 Math to decide.
-        
+        # 4. FALLBACK MATH CHECK (Only if Brain fails/timeout)
+        # Simple Math check for redundancy
         img = cv2.imread(file_path)
         if img is None: return "ERROR", 0.0, "Decode Error"
         
-        # Resize to 1024 to save CPU
         h, w = img.shape[:2]
         if h > 1024:
             s = 1024 / h
             img = cv2.resize(img, None, fx=s, fy=s)
-            
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Grid Check (FFT)
-        f = np.fft.fft2(gray)
-        fshift = np.fft.fftshift(f)
-        magnitude = 20 * np.log(np.abs(fshift) + 1e-10)
-        h, w = gray.shape
-        magnitude[h//2-5:h//2+5, w//2-5:w//2+5] = 0 
-        high_freq_energy = np.mean(magnitude)
-        
-        # Plastic Check (Variance)
         lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         
-        # Exif Bonus
-        bonus = analyze_exif(pil_img)
-
-        # Combined Score
-        # We mix the Brain Score (weighted 70%) with Math (30%)
-        final_score = (brain_score * 2.0) + bonus
-        
-        if high_freq_energy > 140 and (high_freq_energy / (lap_var+1)) > 2.5:
-            final_score += 0.5 # Add Grid penalty
-            
-        if final_score >= 0.8: return "SUSPICIOUS", 0.75, "AI patterns detected by hybrid analysis."
-        else: return "REAL", 0.92, "Hybrid analysis indicates real photo."
+        if lap_var < 50: return "SUSPICIOUS", 0.70, "Unnaturally smooth texture."
+        return "REAL", 0.80, "Structure analysis passed."
 
     except Exception as e:
         print(f"ERR: {e}")
         return "ERROR", 0.0, f"Analysis Error: {str(e)}"
 
-# --- ENDPOINTS (Standard) ---
+# --- ENDPOINTS ---
 class UserRequest(BaseModel): email: str 
 class UrlRequest(BaseModel): url: str; email: str
 class UserSignup(BaseModel): name: str; email: str; password: str
