@@ -36,84 +36,105 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- V11: NUCLEAR DETECTION ENGINE ---
+# --- V12: ROBUST VIDEO HANDLING ---
 
 def analyze_exif(pil_img):
-    """Checks if the camera data looks real."""
     try:
         exif = pil_img.getexif()
-        if not exif: return 0.0 # No data = Suspicious
-        
-        # Look for Make/Model (e.g. "Apple", "Canon")
-        make = exif.get(271) # Make
-        model = exif.get(272) # Model
-        software = exif.get(305) # Software
-        
-        # AI often deletes these or puts "Creator Tool"
-        if make and model:
-            return -0.5 # BONUS: Likely Real Camera
+        if not exif: return 0.0
+        make = exif.get(271)
+        model = exif.get(272)
+        if make and model: return -0.5
         return 0.0
-    except:
-        return 0.0
+    except: return 0.0
 
 def analyze_tile_v11(tile_gray, tile_hsv):
     score = 0.0
     
-    # 1. FFT (The "Invisible Grid" Check)
     f = np.fft.fft2(tile_gray)
     fshift = np.fft.fftshift(f)
     magnitude = 20 * np.log(np.abs(fshift) + 1e-10)
     h, w = tile_gray.shape
-    # Mask the center (low freq) to see only high freq artifacts
     magnitude[h//2-5:h//2+5, w//2-5:w//2+5] = 0 
     high_freq_energy = np.mean(magnitude)
     
-    # 2. VARIANCE (The "Roughness" Check)
-    # Real textures are rough. AI textures are often smooth math.
     lap_var = cv2.Laplacian(tile_gray, cv2.CV_64F).var()
     
-    # 3. THE RATIO (The Magic Number)
-    # AI has High Energy (Grid) but Low Variance (Smoothness).
-    # Real photos have High Energy AND High Variance.
-    # We calculate: Energy / Variance
     ratio = high_freq_energy / (lap_var + 1.0)
     
-    # Thresholds tuned for "Nuclear" sensitivity
-    if high_freq_energy > 130 and ratio > 2.0:
-        score += 2.0 # STRONG FAKE SIGNAL (Hidden Grid)
-    elif lap_var < 50:
-        score += 1.0 # PLASTIC SIGNAL (Too Smooth)
+    if high_freq_energy > 130 and ratio > 2.0: score += 2.0
+    elif lap_var < 50: score += 1.0
         
-    # 4. COLOR CLIPPING
     sat = tile_hsv[:,:,1]
-    if np.mean(sat) > 160: score += 0.5 # NEON SIGNAL
+    if np.mean(sat) > 160: score += 0.5
 
     return score
 
 def analyze_media(file_path):
     try:
-        pil_img = Image.open(file_path)
-        
-        # A. METADATA DEEP SCAN
+        # A. METADATA SCAN (Images Only)
         try:
+            pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
-            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly", "a1111", "comfyui"]
+            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly", "a1111"]
             if any(k in meta.lower() for k in ai_tags):
                 return "FAKE", 0.99, "Metadata explicit AI tag found."
-        except: pass
-        
-        # Get "Real Camera" Bonus
-        real_camera_bonus = analyze_exif(pil_img)
+        except: pass # It might be a video, so we ignore PIL errors
 
-        # B. TILE ANALYSIS (Full Resolution)
+        # B. DETERMINE TYPE (Video or Image)
+        # We try to open as video first.
+        cap = cv2.VideoCapture(file_path)
+        is_video = False
+        if cap.isOpened():
+            # Check frame count to confirm it's actually a playable video
+            if int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 1:
+                is_video = True
+        
+        # --- VIDEO ANALYSIS PATH ---
+        if is_video:
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frames < 5: 
+                cap.release()
+                return "REAL", 0.85, "Video too short to analyze."
+
+            fake_hits = 0
+            checks = 6
+            for _ in range(checks):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(0, frames-1))
+                ret, frame = cap.read()
+                if ret:
+                    fh, fw = frame.shape[:2]
+                    # Resize for speed
+                    if fh > 1080:
+                        fs = 1080 / fh
+                        frame = cv2.resize(frame, None, fx=fs, fy=fs)
+                    
+                    fgray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    fhsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                    
+                    cy, cx = fh//2, fw//2
+                    # Ensure crop is within bounds
+                    if cy-100 >= 0 and cy+100 < fh and cx-100 >= 0 and cx+100 < fw:
+                        tile_g = fgray[cy-100:cy+100, cx-100:cx+100]
+                        tile_h = fhsv[cy-100:cy+100, cx-100:cx+100]
+                        if analyze_tile_v11(tile_g, tile_h) >= 1.0: fake_hits += 1
+            cap.release()
+
+            if fake_hits >= 2: return "FAKE", 0.95, "Inconsistent artifacts (AI Video)."
+            else: return "REAL", 0.90, "Motion consistent with optical capture."
+
+        # --- IMAGE ANALYSIS PATH ---
+        cap.release() # Close video handle just in case
         img = cv2.imread(file_path)
-        if img is None: return "ERROR", 0.0, "Could not decode image."
+        if img is None: return "ERROR", 0.0, "Could not decode media file."
         
-        # Split into tiles (200x200)
-        tile_size = 200
+        # Add Camera Bonus
+        try: real_camera_bonus = analyze_exif(Image.open(file_path))
+        except: real_camera_bonus = 0
+        
         h, w = img.shape[:2]
+        tile_size = 200
         
-        # Downscale HUGE images to prevent server crash, but keep them big
         if h > 2000:
             s = 2000 / h
             img = cv2.resize(img, None, fx=s, fy=s)
@@ -123,9 +144,7 @@ def analyze_media(file_path):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
         max_score = 0.0
-        tiles_checked = 0
         
-        # Randomly check 10 tiles to be fast but accurate
         for _ in range(12):
             if h < tile_size or w < tile_size: break
             y = random.randint(0, h - tile_size)
@@ -136,19 +155,17 @@ def analyze_media(file_path):
             
             s = analyze_tile_v11(tile_g, tile_h)
             if s > max_score: max_score = s
-            tiles_checked += 1
             
-        # Apply Bonus
         final_score = max_score + real_camera_bonus
         
-        # VERDICT LOGIC
         if final_score >= 1.5: return "FAKE", 0.98, "Synthetic grid pattern detected."
-        elif final_score >= 0.8: return "SUSPICIOUS", 0.70, "Unnatural smoothness or lighting."
+        elif final_score >= 0.8: return "SUSPICIOUS", 0.70, "Unnatural smoothness/lighting."
         else: return "REAL", 0.94, "Organic noise profile confirmed."
 
     except Exception as e:
+        # RETURN ACTUAL ERROR FOR DEBUGGING
         print(f"ERR: {e}")
-        return "ERROR", 0.0, "Analysis Failed"
+        return "ERROR", 0.0, f"Analysis Error: {str(e)}"
 
 # --- AUTO-HEAL & ENDPOINTS ---
 class UserRequest(BaseModel): email: str 
@@ -161,7 +178,6 @@ class ForgotPasswordRequest(BaseModel): email: str
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
 def ensure_user_exists(email):
-    """If Render wiped DB, silently re-create user to prevent blocking."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
@@ -195,26 +211,44 @@ async def analyze_url(req: UrlRequest):
     if not check_limits(req.email): return JSONResponse(content={"verdict": "LIMIT_REACHED", "message": "Limit reached"}, status_code=403)
     try:
         temp_dir = tempfile.mkdtemp()
-        ydl_opts = {'format': 'best', 'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 'quiet': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([req.url])
+        # FIX: 'best[ext=mp4]' avoids FFMPEG merging issues on Render
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best', 
+            'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 
+            'quiet': True,
+            'noplaylist': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl: 
+            ydl.download([req.url])
+            
         files = glob.glob(os.path.join(temp_dir, "*"))
-        if not files: return {"verdict": "ERROR", "message": "Download failed"}
+        if not files: return {"verdict": "ERROR", "message": "Download failed (No file)"}
+        
         v, c, m = analyze_media(files[0])
+        
+        # Cleanup
+        try: shutil.rmtree(temp_dir)
+        except: pass
+        
         return {"verdict": v, "score": c, "message": m}
     except Exception as e: return JSONResponse(content={"verdict": "ERROR", "message": str(e)}, status_code=400)
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...), email: str = Form(...)):
     if not check_limits(email): return JSONResponse(content={"verdict": "LIMIT_REACHED", "message": "Limit reached"}, status_code=403)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp:
-        shutil.copyfileobj(file.file, temp)
-        temp_path = temp.name
+    
+    # Save Upload
+    temp_filename = f"upload_{random.randint(1000,9999)}_{file.filename}"
+    with open(temp_filename, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
     try:
-        v, c, m = analyze_media(temp_path)
+        v, c, m = analyze_media(temp_filename)
         return {"verdict": v, "score": c, "message": m}
-    except Exception as e: return JSONResponse(content={"error": str(e)}, status_code=500)
+    except Exception as e: 
+        return JSONResponse(content={"error": str(e)}, status_code=500)
     finally:
-         if os.path.exists(temp_path): os.remove(temp_path)
+         if os.path.exists(temp_filename): os.remove(temp_filename)
 
 @app.post("/signup")
 async def signup(user: UserSignup):
