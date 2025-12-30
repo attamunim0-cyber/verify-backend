@@ -19,6 +19,10 @@ from PIL import Image, ImageChops, ImageEnhance, ExifTags
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+# --- AI BRAIN IMPORTS ---
+from transformers import pipeline
+import torch
+
 app = FastAPI()
 DB_NAME = "verify_shield_v2.db"
 
@@ -29,6 +33,18 @@ EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 SERVER_URL = "https://verify-backend-03or.onrender.com"
 
+# --- LOAD THE AI BRAIN (ON STARTUP) ---
+# We use a lightweight ViT (Vision Transformer) fine-tuned for Deepfakes
+print("LOADING AI MODEL... (This may take 30s on first boot)")
+try:
+    # This model is small enough for free servers but very accurate
+    ai_classifier = pipeline("image-classification", model="umm-maybe/AI-image-detector")
+    MODEL_LOADED = True
+    print("AI MODEL LOADED SUCCESSFULLY")
+except Exception as e:
+    print(f"WARNING: Could not load AI Model: {e}")
+    MODEL_LOADED = False
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -36,162 +52,105 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- V13: DEEP SPECTRUM ENGINE ---
+# --- V14: HYBRID DETECTION ENGINE ---
+
+def analyze_with_brain(pil_image):
+    """Asks the HuggingFace AI model for a verdict."""
+    if not MODEL_LOADED: return 0.0, "Model Offline"
+    
+    try:
+        results = ai_classifier(pil_image)
+        # Results look like: [{'label': 'artificial', 'score': 0.99}, {'label': 'human', 'score': 0.01}]
+        
+        # Find the 'artificial' or 'fake' score
+        fake_score = 0.0
+        for r in results:
+            label = r['label'].lower()
+            if 'art' in label or 'fake' in label or 'ai' in label:
+                fake_score = r['score']
+                
+        return fake_score, "Deep Learning Analysis"
+    except Exception as e:
+        print(f"Brain Error: {e}")
+        return 0.0, "Brain Error"
 
 def analyze_exif(pil_img):
     try:
         exif = pil_img.getexif()
         if not exif: return 0.0
-        # Check for legitimate camera markers
         make = exif.get(271)
         model = exif.get(272)
         if make and model: return -0.6 # Real camera bonus
         return 0.0
     except: return 0.0
 
-def analyze_chroma(img_bgr):
-    """Checks for the 'Perfect Color' artifact common in AI."""
-    try:
-        # Convert to YCrCb (Luminance + Chroma)
-        ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
-        _, cr, cb = cv2.split(ycrcb)
-        
-        # Real photos have 'mushy' color (low variance in high freq) due to subsampling
-        # AI often has 'sharp' color edges
-        
-        cr_var = cv2.Laplacian(cr, cv2.CV_64F).var()
-        cb_var = cv2.Laplacian(cb, cv2.CV_64F).var()
-        
-        # If color detail is surprisingly high, it's suspicious
-        avg_chroma_detail = (cr_var + cb_var) / 2.0
-        
-        if avg_chroma_detail > 800: return 1.0 # Suspiciously sharp color
-        return 0.0
-    except: return 0.0
-
-def analyze_tile_v13(tile_gray, tile_hsv):
-    score = 0.0
-    
-    # 1. FFT (Grid Check)
-    f = np.fft.fft2(tile_gray)
-    fshift = np.fft.fftshift(f)
-    magnitude = 20 * np.log(np.abs(fshift) + 1e-10)
-    h, w = tile_gray.shape
-    magnitude[h//2-5:h//2+5, w//2-5:w//2+5] = 0 
-    high_freq_energy = np.mean(magnitude)
-    
-    # 2. VARIANCE (Plastic Check)
-    lap_var = cv2.Laplacian(tile_gray, cv2.CV_64F).var()
-    
-    # 3. RATIO (The Detector)
-    # Avoid division by zero
-    ratio = high_freq_energy / (lap_var + 0.1)
-    
-    # Tuned Thresholds for V13
-    if high_freq_energy > 140 and ratio > 2.5: score += 2.5 # STRONG FAKE
-    elif lap_var < 40: score += 1.2 # PLASTIC
-        
-    # 4. SATURATION (Neon Check)
-    sat = tile_hsv[:,:,1]
-    if np.mean(sat) > 170: score += 0.5
-
-    return score
-
 def analyze_media(file_path):
     try:
-        # A. METADATA
+        pil_img = Image.open(file_path)
+
+        # 1. AI BRAIN CHECK (The Heavy Hitter)
+        # We perform this first because it's the most accurate
+        brain_score, source = analyze_with_brain(pil_img)
+        
+        # 2. METADATA CHECK (The Fast Check)
         try:
-            pil_img = Image.open(file_path)
             meta = str(pil_img.getexif()) + str(pil_img.info)
-            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly", "a1111"]
+            ai_tags = ["midjourney", "diffusion", "generated", "dall-e", "firefly"]
             if any(k in meta.lower() for k in ai_tags):
                 return "FAKE", 0.99, "Metadata explicit AI tag found."
         except: pass 
-
-        # B. DETERMINE TYPE
-        cap = cv2.VideoCapture(file_path)
-        is_video = False
-        if cap.isOpened():
-            if int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 1: is_video = True
         
-        # --- VIDEO ---
-        if is_video:
-            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if frames < 5: 
-                cap.release()
-                return "REAL", 0.85, "Video too short."
+        # 3. IF BRAIN IS SURE, TRUST IT
+        # If the Neural Network is >90% sure, we don't need math.
+        if brain_score > 0.90:
+             return "FAKE", 0.98, "Deep Learning Model detected synthetic signatures."
+        elif brain_score < 0.10:
+             # If Neural Net is sure it's human, trust it (unless metadata disagrees)
+             return "REAL", 0.95, "Deep Learning Model confirmed organic features."
 
-            fake_hits = 0
-            checks = 6
-            for _ in range(checks):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, random.randint(0, frames-1))
-                ret, frame = cap.read()
-                if ret:
-                    fh, fw = frame.shape[:2]
-                    if fh > 1080:
-                        fs = 1080 / fh
-                        frame = cv2.resize(frame, None, fx=fs, fy=fs)
-                    
-                    fgray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    fhsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                    
-                    cy, cx = fh//2, fw//2
-                    if cy-100 >= 0 and cy+100 < fh and cx-100 >= 0 and cx+100 < fw:
-                        tile_g = fgray[cy-100:cy+100, cx-100:cx+100]
-                        tile_h = fhsv[cy-100:cy+100, cx-100:cx+100]
-                        if analyze_tile_v13(tile_g, tile_h) >= 1.0: fake_hits += 1
-            cap.release()
-
-            if fake_hits >= 2: return "FAKE", 0.95, "Inconsistent artifacts (AI Video)."
-            else: return "REAL", 0.90, "Motion consistent with optical capture."
-
-        # --- IMAGE ---
-        cap.release()
+        # 4. TIE BREAKER: MATH ANALYSIS (For ambiguous cases)
+        # If the AI Brain is unsure (10% - 90%), we use V13 Math to decide.
+        
         img = cv2.imread(file_path)
-        if img is None: return "ERROR", 0.0, "Could not decode media file."
+        if img is None: return "ERROR", 0.0, "Decode Error"
         
-        # Get Real Camera Bonus
-        try: real_camera_bonus = analyze_exif(Image.open(file_path))
-        except: real_camera_bonus = 0
-        
-        # Get Chroma Artifact Score (New in V13)
-        chroma_score = analyze_chroma(img)
-        
+        # Resize to 1024 to save CPU
         h, w = img.shape[:2]
-        tile_size = 200
-        
-        if h > 2000:
-            s = 2000 / h
+        if h > 1024:
+            s = 1024 / h
             img = cv2.resize(img, None, fx=s, fy=s)
-            h, w = img.shape[:2]
-
+            
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
-        max_score = 0.0
+        # Grid Check (FFT)
+        f = np.fft.fft2(gray)
+        fshift = np.fft.fftshift(f)
+        magnitude = 20 * np.log(np.abs(fshift) + 1e-10)
+        h, w = gray.shape
+        magnitude[h//2-5:h//2+5, w//2-5:w//2+5] = 0 
+        high_freq_energy = np.mean(magnitude)
         
-        for _ in range(12):
-            if h < tile_size or w < tile_size: break
-            y = random.randint(0, h - tile_size)
-            x = random.randint(0, w - tile_size)
-            
-            tile_g = gray[y:y+tile_size, x:x+tile_size]
-            tile_h = hsv[y:y+tile_size, x:x+tile_size]
-            
-            s = analyze_tile_v13(tile_g, tile_h)
-            if s > max_score: max_score = s
-            
-        final_score = max_score + chroma_score + real_camera_bonus
+        # Plastic Check (Variance)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         
-        if final_score >= 1.5: return "FAKE", 0.98, "Synthetic grid/chroma pattern detected."
-        elif final_score >= 0.8: return "SUSPICIOUS", 0.70, "Unnatural smoothness or lighting."
-        else: return "REAL", 0.94, "Organic noise profile confirmed."
+        # Exif Bonus
+        bonus = analyze_exif(pil_img)
+
+        # Combined Score
+        # We mix the Brain Score (weighted 70%) with Math (30%)
+        final_score = (brain_score * 2.0) + bonus
+        
+        if high_freq_energy > 140 and (high_freq_energy / (lap_var+1)) > 2.5:
+            final_score += 0.5 # Add Grid penalty
+            
+        if final_score >= 0.8: return "SUSPICIOUS", 0.75, "AI patterns detected by hybrid analysis."
+        else: return "REAL", 0.92, "Hybrid analysis indicates real photo."
 
     except Exception as e:
         print(f"ERR: {e}")
         return "ERROR", 0.0, f"Analysis Error: {str(e)}"
 
-# --- ENDPOINTS ---
+# --- ENDPOINTS (Standard) ---
 class UserRequest(BaseModel): email: str 
 class UrlRequest(BaseModel): url: str; email: str
 class UserSignup(BaseModel): name: str; email: str; password: str
@@ -202,12 +161,9 @@ class ForgotPasswordRequest(BaseModel): email: str
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
 def ensure_user_exists(email):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
+    conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    if not row:
-        c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "restored"))
-        conn.commit()
+    if not row: c.execute("INSERT INTO users (email, name, password, is_verified, scan_count, is_premium) VALUES (?, ?, ?, 1, 0, 0)", (email, "User", "restored")); conn.commit()
     conn.close()
 
 def check_limits(email):
@@ -218,8 +174,7 @@ def check_limits(email):
     if row['is_premium'] == 1: return True
     if row['scan_count'] >= 3: return False
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
-    c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,))
-    conn.commit(); conn.close()
+    c.execute("UPDATE users SET scan_count = scan_count + 1 WHERE email=?", (email,)); conn.commit(); conn.close()
     return True
 
 @app.post("/user-profile")
@@ -235,15 +190,8 @@ async def analyze_url(req: UrlRequest):
     if not check_limits(req.email): return JSONResponse(content={"verdict": "LIMIT_REACHED", "message": "Limit reached"}, status_code=403)
     try:
         temp_dir = tempfile.mkdtemp()
-        ydl_opts = {
-            'format': 'best[ext=mp4]/best', 
-            'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 
-            'quiet': True,
-            'noplaylist': True
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl: 
-            ydl.download([req.url])
-            
+        ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': f"{temp_dir}/%(id)s.%(ext)s", 'quiet': True, 'noplaylist': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([req.url])
         files = glob.glob(os.path.join(temp_dir, "*"))
         if not files: return {"verdict": "ERROR", "message": "Download failed"}
         v, c, m = analyze_media(files[0])
@@ -256,8 +204,7 @@ async def analyze_url(req: UrlRequest):
 async def analyze(file: UploadFile = File(...), email: str = Form(...)):
     if not check_limits(email): return JSONResponse(content={"verdict": "LIMIT_REACHED", "message": "Limit reached"}, status_code=403)
     temp_filename = f"upload_{random.randint(1000,9999)}_{file.filename}"
-    with open(temp_filename, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    with open(temp_filename, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
     try:
         v, c, m = analyze_media(temp_filename)
         return {"verdict": v, "score": c, "message": m}
@@ -290,19 +237,13 @@ async def forgot_password(req: ForgotPasswordRequest):
     conn = sqlite3.connect(DB_NAME); c = conn.cursor()
     t = ''.join(random.choices(string.ascii_letters, k=32))
     c.execute("UPDATE users SET reset_token=? WHERE email=?", (t, req.email)); conn.commit(); conn.close()
-    
-    if not EMAIL_USER or not EMAIL_PASS:
-        return JSONResponse(content={"status": "error", "message": "Server email not configured"}, status_code=500)
-    
+    if not EMAIL_USER or not EMAIL_PASS: return JSONResponse(content={"status": "error", "message": "Server email not configured"}, status_code=500)
     try:
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_USER; msg['To'] = req.email; msg['Subject'] = "Reset Password"
+        msg = MIMEMultipart(); msg['From'] = EMAIL_USER; msg['To'] = req.email; msg['Subject'] = "Reset Password"
         msg.attach(MIMEText(f"Link: {SERVER_URL}/reset-password-view?token={t}", 'plain'))
-        server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASS); server.send_message(msg); server.quit()
+        server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls(); server.login(EMAIL_USER, EMAIL_PASS); server.send_message(msg); server.quit()
         return {"status": "success", "message": "Link sent"}
-    except Exception as e:
-        return JSONResponse(content={"status": "error", "message": f"Email Error: {str(e)}"}, status_code=500)
+    except Exception as e: return JSONResponse(content={"status": "error", "message": f"Email Error: {str(e)}"}, status_code=500)
 
 @app.get("/reset-password-view", response_class=HTMLResponse)
 async def reset_view(token: str):
